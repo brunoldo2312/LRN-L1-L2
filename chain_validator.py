@@ -11,6 +11,7 @@ Uso:
 """
 
 import time
+from typing import Any
 
 
 # ============================================================
@@ -62,7 +63,23 @@ class ChainVerificationResult:
 # VALIDAÇÃO
 # ============================================================
 def verify_chain(blockchain) -> ChainVerificationResult:
-    """Verifica toda a cadeia do gênesis até o topo."""
+    """
+    Verifica toda a cadeia do gênese até o topo.
+
+    Checagens:
+      1.  Gênese válido (height 0, prev_hash zerado)
+      2.  Alturas sequenciais
+      3.  Encadeamento (prev_hash == hash anterior)
+      4.  Hash declarado == recalculado
+      5.  PoW válido (hash ≤ target)
+      6.  Merkle root confere com txids
+      7.  Primeira tx do bloco é coinbase
+      8.  Coinbase ≤ recompensa + taxas
+      9.  Ausência de gasto duplo
+      10. Ausência de txid duplicada
+      11. Ausência de saldo negativo
+      12. Recompensa compatível com halving
+    """
     from blockchain import (
         block_hash, meets_difficulty, compute_merkle_root,
         txid as calc_txid, GENESIS_PREV,
@@ -93,33 +110,50 @@ def verify_chain(blockchain) -> ChainVerificationResult:
         result.blocks_checked += 1
         prefixo = f"Bloco #{h}"
 
+        # 1) gênese
         if h == 0:
             if block["height"] != 0:
                 result.add_error(f"{prefixo}: height != 0")
             if block["prev_hash"] != GENESIS_PREV:
                 result.add_error(f"{prefixo}: prev_hash de gênese inválido")
 
+        # 2) altura sequencial
         if block["height"] != h:
             result.add_error(f"{prefixo}: height declarado = {block['height']}")
 
+        # 3) encadeamento
         if h > 0 and block["prev_hash"] != prev_hash:
-            result.add_error(f"{prefixo}: prev_hash não corresponde ao bloco #{h-1}")
+            result.add_error(
+                f"{prefixo}: prev_hash não corresponde ao bloco #{h-1}"
+            )
 
+        # 4) hash recalculado
         recalc = block_hash(
             block["prev_hash"], block["merkle"], block["timestamp"],
             block["nonce"], block["difficulty"],
         )
         if recalc != block["hash"]:
-            result.add_error(f"{prefixo}: hash adulterado")
+            result.add_error(
+                f"{prefixo}: hash adulterado "
+                f"({block['hash'][:14]}… vs {recalc[:14]}…)"
+            )
 
+        # 5) PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
-            result.add_error(f"{prefixo}: não atende à dificuldade {block['difficulty']}")
+            result.add_error(
+                f"{prefixo}: não atende à dificuldade {block['difficulty']}"
+            )
 
+        # 6) merkle
         txids = [t["txid"] for t in block["transactions"]]
         merkle_calc = compute_merkle_root(txids)
         if merkle_calc != block["merkle"]:
-            result.add_error(f"{prefixo}: merkle divergente")
+            result.add_error(
+                f"{prefixo}: merkle divergente "
+                f"({block['merkle'][:12]}… vs {merkle_calc[:12]}…)"
+            )
 
+        # 7) coinbase
         if not block["transactions"]:
             result.add_error(f"{prefixo}: bloco sem transações")
             prev_hash = block["hash"]
@@ -130,6 +164,7 @@ def verify_chain(blockchain) -> ChainVerificationResult:
         if not is_cb:
             result.add_error(f"{prefixo}: primeira tx não é coinbase")
 
+        # 8) coinbase ≤ recompensa + taxas
         if is_cb:
             reward_esp = blockchain.current_reward(h)
             fees = 0
@@ -140,8 +175,12 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                     pass
             cb_total = sum(o["amount"] for o in cb["outputs"])
             if cb_total > reward_esp + fees:
-                result.add_error(f"{prefixo}: coinbase {cb_total} > recompensa+fees")
+                result.add_error(
+                    f"{prefixo}: coinbase {cb_total} > "
+                    f"recompensa {reward_esp} + taxas {fees}"
+                )
 
+        # 9/10) cada tx
         for idx, t in enumerate(block["transactions"]):
             result.txs_checked += 1
             short = t.get("txid", "?")[:12]
@@ -162,11 +201,14 @@ def verify_chain(blockchain) -> ChainVerificationResult:
             for inp in t["inputs"]:
                 key = (inp["txid"], inp["vout"])
                 if key in spent_utxos:
-                    result.add_error(f"{prefixo}: gasto duplo — {inp['txid'][:12]}…:{inp['vout']}")
+                    result.add_error(
+                        f"{prefixo}: gasto duplo — {inp['txid'][:12]}…:{inp['vout']}"
+                    )
                 spent_utxos.add(key)
 
         prev_hash = block["hash"]
 
+    # 11) saldo negativo
     try:
         neg = db.conn.execute(
             "SELECT address, SUM(amount) AS s FROM utxos "

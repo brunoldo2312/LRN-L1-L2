@@ -51,12 +51,12 @@ def _convertbits(data, frombits, tobits, pad=True):
     return ret
 
 
-def bech32_encode(hrp: str, data: list) -> str:
+def bech32_encode(hrp, data):
     combined = data + _create_checksum(hrp, data)
     return hrp + "1" + "".join([CHARSET[d] for d in combined])
 
 
-def bech32_decode(bech: str):
+def bech32_decode(bech):
     if any(ord(x) < 33 or ord(x) > 126 for x in bech):
         return (None, None)
     bech = bech.lower()
@@ -77,14 +77,14 @@ def bech32_decode(bech: str):
 HRP = "brn"
 
 
-def address_from_pubkey(pubkey: bytes) -> str:
+def address_from_pubkey(pubkey):
     from crypto import hash160
     h = hash160(pubkey)
     data = _convertbits(list(h), 8, 5, True)
     return bech32_encode(HRP, data)
 
 
-def validate_address(addr: str) -> bool:
+def validate_address(addr):
     try:
         if not isinstance(addr, str):
             return False
