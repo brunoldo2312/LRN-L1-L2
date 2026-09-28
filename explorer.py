@@ -173,4 +173,39 @@ def peers():
             "count": db.contar_peers(apenas_ativos=False),
             "active": db.contar_peers(apenas_ativos=True),
             "peers": db.listar_peers(apenas_ativos=False),
-       
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/events")
+def events():
+    """✅ NOVO: últimos eventos da rede."""
+    try:
+        n = min(int(request.args.get("n", 50)), 200)
+    except ValueError:
+        n = 50
+    db = _db()
+    try:
+        return jsonify(db.ultimos_eventos(n))
+    finally:
+        db.close()
+
+
+@app.route("/api/verify")
+def verify():
+    """✅ NOVO: verifica integridade da cadeia (pode ser lento)."""
+    from blockchain import Blockchain
+    from chain_validator import verify_chain_dict
+    bc = Blockchain(db_path=DB_PATH)
+    try:
+        return jsonify(verify_chain_dict(bc))
+    finally:
+        bc.db.close()
+
+
+if __name__ == "__main__":
+    print(f"🔍 Explorer BRN rodando em http://0.0.0.0:{PORT}")
+    print(f"   DB: {DB_PATH}")
+    print(f"   CORS: {CORS_ORIGIN}")
+    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
