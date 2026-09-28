@@ -1,3 +1,5 @@
+<img width="960" height="448" alt="image" src="https://github.com/user-attachments/assets/aab954b9-bbaa-429d-b9cb-282efcad2bf6" />
+
 📄 Documento de Testes — BRN Node v4
 Projeto: BRN (BrunoCoin) — Blockchain L1 própria
 Versão: v4
