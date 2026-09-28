@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>BRN Wallet</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: #0d1117; color: #e6edf3; padding: 16px; font-size: 14px;
+         line-height: 1.5; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: center;
+           padding-bottom: 12px; border-bottom: 1px solid #30363d; margin-bottom: 14px; }
+  h1 { font-size: 1.25rem; }
+  h1 span { color: #58a6ff; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
+         background:#8b949e; margin-right:6px; }
+  .dot.on { background:#3fb950; }
+  .dot.off { background:#f85149; }
+  .tabs { display:flex; gap:4px; margin-bottom:14px; border-bottom:1px solid #30363d; }
+  .tab { background:transparent; border:none; color:#8b949e; padding:8px 14px;
+         cursor:pointer; font-family:inherit; font-size:.9rem;
+         border-bottom:2px solid transparent; }
+  .tab:hover { color:#e6edf3; }
+  .tab.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+  .panel { display:none; }
+  .panel.active { display:block; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
+          padding:16px; margin-bottom:12px; }
+  .card h2 { font-size:.82rem; color:#8b949e; text-transform:uppercase;
+             letter-spacing:.05em; margin-bottom:10px; }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .stat { background:#0d1117; border:1px solid #21262d; border-radius:6px;
+          padding:10px 12px; }
+  .stat .lbl { font-size:.7rem; color:#8b949e; text-transform:uppercase; }
+  .stat .val { font-size:1.15rem; font-weight:600; color:#58a6ff; margin-top:2px;
+               word-break:break-all; }
+  label { display:block; font-size:.8rem; color:#8b949e; margin:8px 0 4px; }
+  input, select { width:100%; background:#0d1117; border:1px solid #30363d;
+                  border-radius:6px; color:#e6edf3; padding:8px 10px;
+                  font-family:inherit; font-size:.88rem; }
+  input:focus { outline:none; border-color:#58a6ff; }
+  .row { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .btn { background:#21262d; color:#e6edf3; border:1px solid #30363d;
+         padding:8px 14px; border-radius:6px; cursor:pointer;
+         font-family:inherit; font-size:.85rem; }
+  .btn:hover { background:#30363d; }
+  .btn.p { background:#238636; border-color:#2ea043; color:#fff; }
+  .btn.p:hover { background:#2ea043; }
+  .addr { display:block; padding:8px 10px; margin-top:6px;
+          background:#0d1117; border:1px solid #21262d; border-radius:6px;
+          font-family:ui-monospace,Menlo,monospace; font-size:.78rem;
+          color:#79c0ff; word-break:break-all; }
+  .msg { margin-top:10px; padding:9px 11px; border-radius:6px;
+         font-size:.83rem; display:none; }
+  .msg.show { display:block; }
+  .msg.ok   { background:#0d2818; border:1px solid #238636; color:#7ee787; }
+  .msg.err  { background:#2d1416; border:1px solid #8b2424; color:#ffa198; }
+  table { width:100%; border-collapse:collapse; font-size:.82rem; }
+  th, td { padding:7px 8px; text-align:left; border-bottom:1px solid #21262d; }
+  th { color:#8b949e; font-size:.72rem; text-transform:uppercase; font-weight:500; }
+  code { font-family:ui-monospace,Menlo,monospace; font-size:.75rem;
+         background:#0d1117; padding:2px 5px; border-radius:4px; color:#79c0ff; }
+  .footer { text-align:center; margin-top:20px; padding-top:12px;
+            border-top:1px solid #30363d; color:#8b949e; font-size:.75rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>🔷 <span>BRN</span> Wallet</h1>
+  <div>
+    <span class="dot" id="dot"></span>
+    <span id="statusTxt" style="font-size:.82rem;color:#8b949e;">Conectando…</span>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-tab="explorer">🔍 Explorador</button>
+  <button class="tab" data-tab="carteira">💼 Carteira</button>
+  <button class="tab" data-tab="enviar">📤 Enviar</button>
+  <button class="tab" data-tab="arquivo">💾 Arquivo</button>
+</div>
+
+<!-- EXPLORADOR -->
+<div class="panel active" id="p-explorer">
+  <div class="card">
+    <h2>Estado do nó</h2>
+    <div class="grid3">
+      <div class="stat"><div class="lbl">Altura</div><div class="val" id="eHeight">—</div></div>
+      <div class="stat"><div class="lbl">Mempool</div><div class="val" id="eMempool">—</div></div>
+      <div class="stat"><div class="lbl">Dificuldade</div><div class="val" id="eDiff">—</div></div>
+      <div class="stat"><div class="lbl">UTXOs</div><div class="val" id="eUtxos">—</div></div>
+      <div class="stat"><div class="lbl">Recompensa</div><div class="val" id="eReward">—</div></div>
+      <div class="stat"><div class="lbl">Peers</div><div class="val" id="ePeers">—</div></div>
+    </div>
+    <div class="row"><button class="btn p" id="bRefreshExp">🔄 Atualizar</button></div>
+    <div class="msg" id="mExp"></div>
+  </div>
+  <div class="card">
+    <h2>Últimos blocos</h2>
+    <table>
+      <thead><tr><th>#</th><th>Hash</th><th>Timestamp</th><th>Txs</th><th>Dif.</th></tr></thead>
+      <tbody id="tbodyBlocks"><tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CARTEIRA -->
+<div class="panel" id="p-carteira">
+  <div class="card">
+    <h2>Minha carteira</h2>
+    <div class="row">
+      <button class="btn p" id="bGerar">🎲 Gerar nova</button>
+      <button class="btn" id="bAtualizar">🔄 Atualizar saldo</button>
+    </div>
+    <div id="walletBox" style="display:none;">
+      <label>Endereço</label>
+      <span class="addr" id="wAddr">—</span>
+      <label>Saldo</label>
+      <div class="stat" style="margin-top:4px;"><div class="val" id="wSaldo">— BRN</div></div>
+      <label>Chave privada (clique para revelar)</label>
+      <span class="addr" id="wPriv" style="cursor:pointer;filter:blur(4px);">—</span>
+      <label>Chave pública</label>
+      <span class="addr" id="wPub">—</span>
+    </div>
+    <div class="msg" id="mCart"></div>
+  </div>
+  <div class="card">
+    <h2>Minhas transações</h2>
+    <table>
+      <thead><tr><th>TXID</th><th>Altura</th><th>Outputs</th></tr></thead>
+      <tbody id="tbodyMyTxs"><tr><td colspan="3" style="color:#8b949e;">—</td></tr></tbody>
+    </table>
+    <div class="row"><button class="btn" id="bMyTxs">🔄 Carregar</button></div>
+  </div>
+</div>
+
+<!-- ENVIAR -->
+<div class="panel" id="p-enviar">
+  <div class="card">
+    <h2>Enviar BRN</h2>
+    <label>De</label>
+    <input id="txFrom" readonly placeholder="brn1...">
+    <label>Para</label>
+    <input id="txTo" placeholder="brn1...">
+    <label>Valor (BRN)</label>
+    <input id="txAmount" type="number" step="0.00001" min="0.00001" placeholder="1.5">
+    <div class="row"><button class="btn p" id="bEnviar">📤 Enviar</button></div>
+    <div class="msg" id="mEnviar"></div>
+  </div>
+  <div class="card">
+    <h2>Mineração</h2>
+    <div class="row">
+      <button class="btn p" id="bMinerar">⛏️ Minerar bloco</button>
+      <button class="btn" id="bFaucet">🚰 Faucet</button>
+    </div>
+    <div class="msg" id="mMine"></div>
+  </div>
+</div>
+
+<!-- ARQUIVO -->
+<div class="panel" id="p-arquivo">
+  <div class="card">
+    <h2>Salvar carteira criptografada</h2>
+    <label>Nome do arquivo</label>
+    <input id="svName" placeholder="minha_carteira">
+    <label>Senha</label>
+    <input id="svPass" type="password" placeholder="••••••••">
+    <div class="row"><button class="btn p" id="bSalvar">💾 Salvar</button></div>
+    <div class="msg" id="mSalvar"></div>
+  </div>
+  <div class="card">
+    <h2>Carregar carteira</h2>
+    <label>Arquivos salvos</label>
+    <select id="ldList"><option value="">— carregando —</option></select>
+    <label>Ou digite o nome</label>
+    <input id="ldName" placeholder="minha_carteira">
+    <label>Senha</label>
+    <input id="ldPass" type="password" placeholder="••••••••">
+    <div class="row">
+      <button class="btn" id="bListar">🔄 Listar</button>
+      <button class="btn p" id="bCarregar">📂 Carregar</button>
+    </div>
+    <div class="msg" id="mCarregar"></div>
+  </div>
+</div>
+
+<div class="footer">BRN Wallet v3.2 · ponte pywebview</div>
+</div>
+
+<script>
+"use strict";
+let wallet = { address:"", private_key:"", public_key:"" };
+let ready = false;
+
+const $ = id => document.getElementById(id);
+function msg(id, text, type = "info", autoHideMs = 0) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "msg show " + type;
+  if (autoHideMs) setTimeout(() => { el.className = "msg"; }, autoHideMs);
+}
+function clearMsg(id) { $(id).className = "msg"; }
+function fmtBRN(v) { return (Number(v) || 0).toFixed(8).replace(/\.?0+$/, "") + " BRN"; }
+function shortHash(h, n = 14) { return (h || "").slice(0, n) + "…"; }
+
+async function api(method, ...args) {
+  if (!ready) throw new Error("Ponte pywebview ainda nao pronta");
+  const fn = window.pywebview && window.pywebview.api && window.pywebview.api[method];
+  if (typeof fn !== "function") throw new Error("Metodo nao exposto: " + method);
+  return await fn(...args);
+}
+
+async function refreshStatus() {
+  try {
+    const s = await api("node_status");
+    if (!s.ok) throw new Error(s.msg || "offline");
+    $("dot").className = "dot on";
+    $("statusTxt").textContent = "No online";
+    $("eHeight").textContent  = s.height != null ? s.height : "—";
+    $("eMempool").textContent = s.mempool != null ? s.mempool : "—";
+    $("eDiff").textContent    = s.difficulty != null ? s.difficulty : "—";
+    $("eUtxos").textContent   = s.utxos != null ? s.utxos : "—";
+    $("ePeers").textContent   = s.peers != null ? s.peers : "—";
+    $("eReward").textContent  = s.reward ? fmtBRN(s.reward / 1e8) : "—";
+  } catch (e) {
+    $("dot").className = "dot off";
+    $("statusTxt").textContent = "No offline";
+  }
+}
+
+async function carregarBlocos() {
+  const tb = $("tbodyBlocks");
+  tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+  try {
+    const r = await api("list_blocks", 0, 15);
+    if (r.erro) throw new Error(r.erro);
+    const blocos = (r.blocks || []).slice().sort((a,b) => b.height - a.height);
+    if (!blocos.length) {
+      tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem blocos</td></tr>';
+      return;
+    }
+    tb.innerHTML = "";
+    for (const b of blocos) {
+      const tr = document.createElement("tr");
+      const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
+      const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
+      tr.innerHTML = '<td><b>' + b.height + '</b></td>' +
+                     '<td><code>' + shortHash(b.hash, 16) + '</code></td>' +
+                     '<td>' + ts + '</td><td>' + txs + '</td>' +
+                     '<td>' + (b.difficulty != null ? b.difficulty : "—") + '</td>';
+      tb.appendChild(tr);
+    }
+    clearMsg("mExp");
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">' + e.message + '</td></tr>';
+  }
+}
+
+async function gerarCarteira() {
+  clearMsg("mCart");
+  try {
+    const w = await api("generate_wallet");
+    if (w.erro || !w.address) throw new Error(w.erro || "falha ao gerar");
+    wallet = { address: w.address, private_key: w.private_key, public_key: w.public_key };
+    renderCarteira();
+    msg("mCart", "✅ Carteira criada. Guarde a chave privada!", "ok", 5000);
+    await atualizarSaldo();
+    await carregarMinhasTxs();
+  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+}
+
+function renderCarteira() {
+  if (!wallet.address) return;
+  $("walletBox").style.display = "block";
+  $("wAddr").textContent = wallet.address;
+  $("wPriv").textContent = wallet.private_key;
+  $("wPriv").style.filter = "blur(4px)";
+  $("wPub").textContent  = wallet.public_key;
+  $("txFrom").value = wallet.address;
+}
+
+async function atualizarSaldo() {
+  if (!wallet.address) return;
+  try {
+    const p = await api("portfolio", wallet.address);
+    if (p.erro) throw new Error(p.erro);
+    $("wSaldo").textContent = fmtBRN(p.BRN || 0);
+  } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
+}
+
+async function carregarMinhasTxs() {
+  if (!wallet.address) return;
+  const tb = $("tbodyMyTxs");
+  tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Carregando…</td></tr>';
+  try {
+    const r = await api("list_transactions", wallet.address);
+    if (r.erro) throw new Error(r.erro);
+    const txs = (r.transactions || []).slice().reverse();
+    if (!txs.length) {
+      tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Sem transacoes</td></tr>';
+      return;
+    }
+    tb.innerHTML = "";
+    for (const t of txs) {
+      const tr = document.createElement("tr");
+      const outStr = (t.outputs || []).map(function(o) {
+        return ((o.address || "").slice(0,12)) + "… +" + ((o.amount / 1e8).toFixed(4));
+      }).join("<br>");
+      tr.innerHTML = '<td><code>' + shortHash(t.txid, 18) + '</code></td>' +
+                     '<td>' + (t.block_height != null ? t.block_height : "—") + '</td>' +
+                     '<td>' + (outStr || "—") + '</td>';
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="3" style="color:#ffa198;">' + e.message + '</td></tr>';
+  }
+}
+
+async function enviar() {
+  clearMsg("mEnviar");
+  if (!wallet.address) { msg("mEnviar", "❌ Gere uma carteira primeiro.", "err"); return; }
+  const to = $("txTo").value.trim();
+  const amt = parseFloat($("txAmount").value);
+  if (!to) { msg("mEnviar", "❌ Informe o destinatario.", "err"); return; }
+  if (!(amt > 0)) { msg("mEnviar", "❌ Valor invalido.", "err"); return; }
+  try {
+    const r = await api("transfer", wallet.address, to, "BRN", amt,
+                        wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mEnviar", "✅ Aceita. TXID: " + shortHash(r.txid, 20), "ok", 6000);
+      $("txTo").value = ""; $("txAmount").value = "";
+      await atualizarSaldo();
+    } else {
+      msg("mEnviar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mEnviar", "❌ " + e.message, "err"); }
+}
+
+async function minerar() {
+  clearMsg("mMine");
+  if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
+  try {
+    const r = await api("mine_block", wallet.address);
+    if (r.ok) {
+      msg("mMine", "✅ Bloco minerado!", "ok", 5000);
+      await atualizarSaldo();
+      await refreshStatus();
+      await carregarBlocos();
+    } else {
+      msg("mMine", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
+}
+
+async function faucet() {
+  clearMsg("mMine");
+  if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
+  try {
+    const r = await api("call_faucet", wallet.address, wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mMine", "✅ " + (r.msg || "Faucet recebido!"), "ok", 5000);
+      await atualizarSaldo();
+    } else {
+      msg("mMine", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
+}
+
+async function salvar() {
+  clearMsg("mSalvar");
+  if (!wallet.address) { msg("mSalvar", "❌ Sem carteira.", "err"); return; }
+  const name = $("svName").value.trim();
+  const pass = $("svPass").value;
+  if (!name) { msg("mSalvar", "❌ Informe o nome.", "err"); return; }
+  if (!pass) { msg("mSalvar", "❌ Informe a senha.", "err"); return; }
+  try {
+    const r = await api("save_wallet", name, pass,
+                        wallet.address, wallet.private_key, wallet.public_key);
+    if (r.ok) {
+      msg("mSalvar", "✅ " + (r.msg || "Salvo."), "ok", 5000);
+      $("svPass").value = "";
+      await listarWallets();
+    } else {
+      msg("mSalvar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mSalvar", "❌ " + e.message, "err"); }
+}
+
+async function listarWallets() {
+  try {
+    const lista = await api("list_wallets");
+    const sel = $("ldList");
+    sel.innerHTML = '<option value="">— selecione —</option>';
+    (lista || []).forEach(function(w) {
+      const o = document.createElement("option");
+      o.value = w.filename; o.textContent = w.filename;
+      sel.appendChild(o);
+    });
+  } catch (_) {}
+}
+
+async function carregar() {
+  clearMsg("mCarregar");
+  const name = $("ldList").value || $("ldName").value.trim();
+  const pass = $("ldPass").value;
+  if (!name) { msg("mCarregar", "❌ Escolha um arquivo.", "err"); return; }
+  if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
+  try {
+    const r = await api("load_wallet", name, pass);
+    if (r.ok) {
+      wallet = { address: r.address, private_key: r.private_key, public_key: r.public_key };
+      renderCarteira();
+      msg("mCarregar", "✅ Carregada.", "ok", 5000);
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+      $("ldPass").value = "";
+    } else {
+      msg("mCarregar", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) { msg("mCarregar", "❌ " + e.message, "err"); }
+}
+
+function configTabs() {
+  document.querySelectorAll(".tab").forEach(function(t) {
+    t.addEventListener("click", function() {
+      document.querySelectorAll(".tab").forEach(function(x) { x.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function(x) { x.classList.remove("active"); });
+      t.classList.add("active");
+      $("p-" + t.dataset.tab).classList.add("active");
+    });
+  });
+}
+
+function configEventos() {
+  $("bRefreshExp").onclick = carregarBlocos;
+  $("bGerar").onclick      = gerarCarteira;
+  $("bAtualizar").onclick  = atualizarSaldo;
+  $("bMyTxs").onclick      = carregarMinhasTxs;
+  $("bEnviar").onclick     = enviar;
+  $("bMinerar").onclick    = minerar;
+  $("bFaucet").onclick     = faucet;
+  $("bSalvar").onclick     = salvar;
+  $("bListar").onclick     = listarWallets;
+  $("bCarregar").onclick   = carregar;
+  $("wPriv").onclick = function() {
+    const el = $("wPriv");
+    el.style.filter = el.style.filter === "none" ? "blur(4px)" : "none";
+  };
+}
+
+async function boot() {
+  ready = true;
+  configTabs();
+  configEventos();
+  await refreshStatus();
+  await carregarBlocos();
+  await listarWallets();
+  setInterval(refreshStatus, 12000);
+  setInterval(carregarBlocos, 15000);
+}
+
+window.addEventListener("pywebviewready", boot);
+if (window.pywebview && window.pywebview.api) boot();
+</script>
+</body>
+</html>

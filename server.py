@@ -1,6 +1,4 @@
-"""server.py — Backend HTTP do nó BRN (v7)
-v7: + bridge bidirecional (BRN <-> BTC) via blueprints
-"""
+"""server.py — Backend HTTP do no BRN (v8 - sem bridge)"""
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
@@ -18,27 +16,21 @@ CORS(app)
 CHAIN = Blockchain("brn_v2_chain.db")
 WALLETS_FILE = "user_wallets.json"
 
-# Faucet
 FAUCET_AMOUNT_BRN = 10
 FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S = 60 * 60
 _faucet_history = {}
 
-# Rate limit
 RATE_LIMIT = 30
 RATE_WINDOW_S = 60
 _ip_history = {}
 _rate_lock = threading.Lock()
 
-# Cache de saldo
 _cache_saldos = {}
 _cache_lock = threading.Lock()
 CACHE_TTL_S = 5
 
 
-# ============================================================
-# UTILITARIOS
-# ============================================================
 def _rate_limit(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -102,7 +94,7 @@ def nova_carteira():
             "address": w.address,
             "private_key": w.priv_hex,
             "public_key": w.pub_hex,
-            "warning": "Guarde a chave privada. NUNCA compartilhe."
+            "warning": "Guarde a chave privada."
         }
         wallets = carregar_wallets()
         wallets[w.address] = {"public_key": w.pub_hex}
@@ -182,7 +174,7 @@ def transfer():
         pk = data.get("public_key", "")
 
         if asset_id != "BRN":
-            return jsonify({"ok": False, "msg": "So BRN via esta API."}), 400
+            return jsonify({"ok": False, "msg": "So BRN."}), 400
         if not WalletManager.validate_address(sender):
             return jsonify({"ok": False, "msg": "Remetente invalido."}), 400
         if not WalletManager.validate_address(to):
@@ -213,7 +205,8 @@ def transfer():
             if total >= amount_sats + 1000:
                 break
         if total < amount_sats:
-            return jsonify({"ok": False, "msg": f"Saldo insuficiente ({total/1e8:.8f} BRN)."}), 400
+            return jsonify({"ok": False,
+                            "msg": f"Saldo insuficiente ({total/1e8:.8f} BRN)."}), 400
 
         FEE = 1000
         troco = total - amount_sats - FEE
@@ -240,7 +233,7 @@ def transfer():
         _saldo_cache_invalidate(sender)
         _saldo_cache_invalidate(to)
         return jsonify({"ok": True, "txid": tx["txid"], "nonce": nonce,
-                        "msg": "Transacao aceita na mempool."})
+                        "msg": "Aceita na mempool."})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -258,10 +251,10 @@ def mine():
             return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
         block = CHAIN.mine_block(miner)
         if not block:
-            return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
+            return jsonify({"ok": False, "msg": "Falha."}), 500
         _saldo_cache_invalidate(miner)
         return jsonify({"ok": True,
-                        "msg": f"Bloco #{block['height']} minerado!",
+                        "msg": "Bloco minerado!",
                         "block": {"height": block["height"], "hash": block["hash"],
                                   "txs": len(block["transactions"]),
                                   "difficulty": block["difficulty"],
@@ -286,19 +279,14 @@ def faucet():
         hist = _faucet_history.setdefault(addr, [])
         hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
         if len(hist) >= FAUCET_MAX_PER_ADDRESS:
-            return jsonify({"ok": False, "msg": "Limite atingido."}), 429
-        if hist and agora - hist[-1] < FAUCET_COOLDOWN_S:
-            falta = int(FAUCET_COOLDOWN_S - (agora - hist[-1]))
-            return jsonify({"ok": False, "msg": f"Aguarde {falta}s."}), 429
+            return jsonify({"ok": False, "msg": "Limite."}), 429
 
         block = CHAIN.mine_block(addr)
         if not block:
             return jsonify({"ok": False, "msg": "Falha."}), 500
         hist.append(agora)
         _saldo_cache_invalidate(addr)
-        return jsonify({"ok": True,
-                        "msg": f"Faucet enviado! +{FAUCET_AMOUNT_BRN} BRN",
-                        "txid": block["transactions"][0]["txid"],
+        return jsonify({"ok": True, "msg": "Faucet enviado.",
                         "amount": FAUCET_AMOUNT_BRN})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -330,19 +318,13 @@ def status():
     })
 
 
-# ============================================================
-# v4: ENDPOINTS ADICIONAIS
-# ============================================================
 @app.route("/api/fee-estimate", methods=["GET"])
 def fee_estimate():
-    try:
-        return jsonify({"success": True,
-                        "low": CHAIN.estimate_fee("low"),
-                        "medium": CHAIN.estimate_fee("medium"),
-                        "high": CHAIN.estimate_fee("high"),
-                        "min_relay_fee": 1000})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True,
+                    "low": CHAIN.estimate_fee("low"),
+                    "medium": CHAIN.estimate_fee("medium"),
+                    "high": CHAIN.estimate_fee("high"),
+                    "min_relay_fee": 1000})
 
 
 @app.route("/api/work", methods=["GET"])
@@ -360,9 +342,7 @@ def hd_create():
         if strength not in (128, 160, 192, 224, 256):
             return jsonify({"ok": False, "msg": "strength invalido"}), 400
         result = HDWalletManager.create(strength=strength)
-        return jsonify({"ok": True,
-                        "warning": "GUARDE o mnemonico.",
-                        **result})
+        return jsonify({"ok": True, "warning": "GUARDE o mnemonico.", **result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
@@ -401,31 +381,9 @@ def get_nonce(pubkey):
 
 
 # ============================================================
-# v7: REGISTRA BLUEPRINTS DA BRIDGE
-# ============================================================
-# Bridge BRN -> BTC (sua, já existente)
-try:
-    from bridge.api_bridge import bridge_bp
-    from bridge.db_bridge import init_db as _bridge_init
-    app.register_blueprint(bridge_bp)
-    _bridge_init()
-    print("[Bridge] Blueprint BRN->BTC registrado em /api/bridge/*")
-except Exception as e:
-    print(f"[Bridge] Falha ao registrar bridge BRN->BTC: {e}")
-
-# Bridge BTC -> BRN (onramp)
-try:
-    from bridge.onramp import onramp_bp
-    app.register_blueprint(onramp_bp)
-    print("[Bridge] Blueprint BTC->BRN registrado em /api/bridge/onramp/*")
-except Exception as e:
-    print(f"[Bridge] Falha ao registrar onramp: {e}")
-
-
-# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v7 - http://0.0.0.0:{port}")
+    print(f"BRN Server v8 - http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
