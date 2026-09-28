@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRN Explorer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0d1117; color: #e6edf3; padding: 20px; line-height: 1.5;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding-bottom: 16px; border-bottom: 1px solid #30363d; margin-bottom: 24px;
+        }
+        h1 { font-size: 1.6rem; }
+        h1 span { color: #58a6ff; }
+        .status-dot {
+            display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+            background: #3fb950; margin-right: 6px; animation: pulse 2s infinite;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px; margin-bottom: 24px;
+        }
+        .card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 16px;
+        }
+        .card .label { font-size: 0.8rem; color: #8b949e; text-transform: uppercase; }
+        .card .value { font-size: 1.5rem; font-weight: 600; color: #58a6ff; margin-top: 4px; }
+        .section {
+            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 20px; margin-bottom: 16px;
+        }
+        .section h2 { font-size: 1.1rem; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
+        tr:hover { background: #1c2128; }
+        code {
+            font-family: ui-monospace, "SF Mono", Menlo, monospace;
+            font-size: 0.82rem; background: #0d1117; padding: 2px 6px;
+            border-radius: 4px; color: #79c0ff;
+        }
+        .btn {
+            background: #238636; color: white; border: none; padding: 8px 16px;
+            border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-family: inherit;
+        }
+        .btn:hover { background: #2ea043; }
+        .loading { color: #8b949e; font-style: italic; }
+        .footer {
+            text-align: center; margin-top: 32px; padding-top: 16px;
+            border-top: 1px solid #30363d; color: #8b949e; font-size: 0.85rem;
+        }
+        .footer a { color: #58a6ff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔷 <span>BRN</span> Explorer</h1>
+            <div>
+                <span class="status-dot"></span>
+                <span id="online">Online</span>
+                <button class="btn" onclick="carregarTudo()" style="margin-left: 12px;">🔄 Atualizar</button>
+            </div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="label">Altura</div>
+                <div class="value" id="height">—</div>
+            </div>
+            <div class="card">
+                <div class="label">UTXOs</div>
+                <div class="value" id="utxos">—</div>
+            </div>
+            <div class="card">
+                <div class="label">Mempool</div>
+                <div class="value" id="mempool">—</div>
+            </div>
+            <div class="card">
+                <div class="label">Peers</div>
+                <div class="value" id="peers">—</div>
+            </div>
+            <div class="card">
+                <div class="label">Dificuldade</div>
+                <div class="value" id="difficulty">—</div>
+            </div>
+            <div class="card">
+                <div class="label">Recompensa</div>
+                <div class="value" id="reward">—</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📦 Últimos Blocos</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Hash</th>
+                        <th>Timestamp</th>
+                        <th>Txs</th>
+                        <th>Dificuldade</th>
+                    </tr>
+                </thead>
+                <tbody id="blocksBody">
+                    <tr><td colspan="5" class="loading">Carregando…</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>🔗 Tip Hash</h2>
+            <code id="tipHash" style="display: block; word-break: break-all; padding: 10px;">—</code>
+        </div>
+
+        <div class="footer">
+            BRN Node v4 — Blockchain local · <a href="/api/status">/api/status</a> · <a href="/api/work">/api/work</a>
+        </div>
+    </div>
+
+    <script>
+        const API = "";  // mesmo host
+
+        async function fetchJSON(url) {
+            const r = await fetch(url);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return r.json();
+        }
+
+        async function carregarStatus() {
+            try {
+                const s = await fetchJSON(API + "/api/status");
+                document.getElementById("height").textContent = s.height;
+                document.getElementById("utxos").textContent = s.utxos;
+                document.getElementById("mempool").textContent = s.mempool;
+                document.getElementById("peers").textContent = s.peers;
+                document.getElementById("difficulty").textContent = s.difficulty;
+                document.getElementById("reward").textContent =
+                    (s.reward / 1e8).toFixed(2) + " BRN";
+                document.getElementById("tipHash").textContent = s.tip_hash;
+                document.getElementById("online").textContent = "Online";
+                document.getElementById("online").style.color = "#3fb950";
+            } catch (e) {
+                document.getElementById("online").textContent = "Offline";
+                document.getElementById("online").style.color = "#f85149";
+                console.error("Status falhou:", e);
+            }
+        }
+
+        async function carregarBlocos() {
+            const tbody = document.getElementById("blocksBody");
+            try {
+                const blocos = await fetchJSON(API + "/api/latest");
+                if (!blocos || blocos.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="loading">Nenhum bloco ainda</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = "";
+                // mais recentes primeiro
+                blocos.sort((a, b) => b.height - a.height);
+                for (const b of blocos) {
+                    const tr = document.createElement("tr");
+                    const ts = b.timestamp ? new Date(b.timestamp * 1000).toLocaleString("pt-BR") : "—";
+                    tr.innerHTML = `
+                        <td><strong>${b.height}</strong></td>
+                        <td><code>${(b.hash || "").slice(0, 20)}…</code></td>
+                        <td>${ts}</td>
+                        <td>${b.transactions ? b.transactions.length : 0}</td>
+                        <td>${b.difficulty || "—"}</td>
+                    `;
+                    tbody.appendChild(tr);
+                }
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="5" class="loading">Erro ao carregar</td></tr>';
+                console.error("Blocos falhou:", e);
+            }
+        }
+
+        async function carregarTudo() {
+            await Promise.all([carregarStatus(), carregarBlocos()]);
+        }
+
+        carregarTudo();
+        setInterval(carregarTudo, 5000);  // atualiza a cada 5s
+    </script>
+</body>
+</html>
