@@ -1,4 +1,7 @@
-"""blockchain.py - Nucleo da blockchain BRN"""
+"""blockchain.py — Nucleo da blockchain BRN (v5)
+v4: + cumulative_work, + reorg_to, + estimate_fee
+v5: + nonce (protecao replay) em signing_hash, txid e validate_tx
+"""
 import time
 import orjson
 from crypto import double_sha256, sha256
@@ -8,7 +11,6 @@ COIN_NAME = "BrunoCoin"
 TICKER = "BRN"
 DECIMALS = 8
 UNIT = 10 ** DECIMALS
-
 MAX_SUPPLY = 21_000_000 * UNIT
 INITIAL_REWARD = 50 * UNIT
 HALVING_INTERVAL = 210_000
@@ -16,28 +18,33 @@ BLOCK_TIME = 120
 DIFFICULTY_INTERVAL = 2016
 INITIAL_DIFFICULTY = 4
 MAX_TX_PER_BLOCK = 500
+MIN_RELAY_FEE = 1000
+MAX_REORG_DEPTH = 100
 
 GENESIS_PREV = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD = INITIAL_REWARD
 GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t3m2k7h4s6w8c9p2e"
-GENESIS_NONCE = 0
 
 
-def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
+def block_hash(prev_hash, merkle, timestamp, nonce, difficulty):
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
 
 
-def target_from_difficulty(difficulty: int) -> int:
+def target_from_difficulty(difficulty):
     return int("0" * difficulty + "f" * (64 - difficulty), 16)
 
 
-def meets_difficulty(h: str, difficulty: int) -> bool:
+def meets_difficulty(h, difficulty):
     return int(h, 16) <= target_from_difficulty(difficulty)
 
 
-def compute_merkle_root(txids: list) -> str:
+def work_from_difficulty(difficulty):
+    return 16 ** difficulty
+
+
+def compute_merkle_root(txids):
     if not txids:
         return "0" * 64
     layer = [bytes.fromhex(t) for t in txids]
@@ -48,51 +55,44 @@ def compute_merkle_root(txids: list) -> str:
     return layer[0].hex()
 
 
-def make_coinbase(address: str, height: int, reward: int) -> dict:
-    cb = {
-        "txid": "",
-        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
-        "outputs": [{"address": address, "amount": reward, "pubkey": ""}],
-        "timestamp": int(time.time()),
-        "locktime": 0,
-        "height": height,
-    }
+def make_coinbase(address, height, reward):
+    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+          "outputs": [{"address": address, "amount": reward, "pubkey": ""}],
+          "timestamp": int(time.time()), "locktime": 0, "height": height, "nonce": 0}
     cb["txid"] = txid(cb)
     return cb
 
 
-def txid(tx: dict) -> str:
+def txid(tx):
+    """Calcula o txid. Inclui nonce desde v5."""
     core = {
         "inputs": [{"txid": i["txid"], "vout": i["vout"]} for i in tx["inputs"]],
         "outputs": tx["outputs"],
         "timestamp": tx["timestamp"],
         "locktime": tx.get("locktime", 0),
+        "nonce": tx.get("nonce", 0),
     }
     if "height" in tx:
         core["height"] = tx["height"]
     return double_sha256(orjson.dumps(core, option=orjson.OPT_SORT_KEYS)).hex()
 
 
-def signing_hash(tx: dict) -> bytes:
+def signing_hash(tx):
+    """Hash que e assinado. Inclui nonce desde v5."""
     core = {
-        "inputs": [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
-                   for i in tx["inputs"]],
+        "inputs": [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")} for i in tx["inputs"]],
         "outputs": tx["outputs"],
         "timestamp": tx["timestamp"],
         "locktime": tx.get("locktime", 0),
+        "nonce": tx.get("nonce", 0),
     }
     return double_sha256(orjson.dumps(core, option=orjson.OPT_SORT_KEYS))
 
 
-def build_genesis() -> dict:
-    cb = {
-        "txid": "",
-        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
-        "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD, "pubkey": ""}],
-        "timestamp": GENESIS_TIMESTAMP,
-        "locktime": 0,
-        "height": 0,
-    }
+def build_genesis():
+    cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+          "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD, "pubkey": ""}],
+          "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
     cb["txid"] = txid(cb)
     merkle = compute_merkle_root([cb["txid"]])
     nonce = 0
@@ -101,18 +101,15 @@ def build_genesis() -> dict:
         if h.startswith("0"):
             break
         nonce += 1
-    return {
-        "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-        "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
-        "merkle": merkle, "difficulty": 1, "transactions": [cb],
-    }
+    return {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP,
+            "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb]}
 
 
 GENESIS_BLOCK = build_genesis()
 
 
 class Blockchain:
-    def __init__(self, db_path: str = "brn_v2_chain.db", genesis_address: str = None):
+    def __init__(self, db_path="brn_v2_chain.db", genesis_address=None):
         self.db = ChainDB(db_path)
         if self.db.height() < 0:
             g = GENESIS_BLOCK
@@ -123,13 +120,10 @@ class Blockchain:
             self.db.set_meta("genesis_hash", g["hash"])
 
     @staticmethod
-    def _genesis_with_address(address: str) -> dict:
-        cb = {
-            "txid": "",
-            "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
-            "outputs": [{"address": address, "amount": GENESIS_REWARD, "pubkey": ""}],
-            "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0,
-        }
+    def _genesis_with_address(address):
+        cb = {"txid": "", "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+              "outputs": [{"address": address, "amount": GENESIS_REWARD, "pubkey": ""}],
+              "timestamp": GENESIS_TIMESTAMP, "locktime": 0, "height": 0, "nonce": 0}
         cb["txid"] = txid(cb)
         merkle = compute_merkle_root([cb["txid"]])
         nonce = 0
@@ -138,19 +132,16 @@ class Blockchain:
             if h.startswith("0"):
                 break
             nonce += 1
-        return {
-            "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
-            "merkle": merkle, "difficulty": 1, "transactions": [cb],
-        }
+        return {"height": 0, "hash": h, "prev_hash": GENESIS_PREV, "timestamp": GENESIS_TIMESTAMP,
+                "nonce": nonce, "merkle": merkle, "difficulty": 1, "transactions": [cb]}
 
-    def current_reward(self, height: int) -> int:
+    def current_reward(self, height):
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
             return 0
         return INITIAL_REWARD >> halvings
 
-    def current_difficulty(self) -> int:
+    def current_difficulty(self):
         h = self.db.height()
         if h < DIFFICULTY_INTERVAL:
             return INITIAL_DIFFICULTY
@@ -165,14 +156,53 @@ class Blockchain:
         new = max(prev // 4, min(prev * 4, new))
         return max(1, new)
 
-    def validate_tx(self, tx: dict, from_mempool: bool = False):
+    def cumulative_work(self):
+        total = 0
+        for h in range(self.db.height() + 1):
+            b = self.db.get_block(h)
+            if b:
+                total += work_from_difficulty(b["difficulty"])
+        return total
+
+    def cumulative_work_of_chain(self, blocks):
+        return sum(work_from_difficulty(b["difficulty"]) for b in blocks)
+
+    def estimate_fee(self, priority="medium"):
+        stats = self.db.mempool_stats()
+        count = stats["count"]
+        fees = stats["fees"]
+        if count == 0:
+            return MIN_RELAY_FEE
+        fees_sorted = sorted(fees, reverse=True)
+        n = len(fees_sorted)
+        if priority == "high":
+            idx = max(0, n // 10)
+            return max(MIN_RELAY_FEE, fees_sorted[idx] * 2)
+        elif priority == "low":
+            idx = min(n - 1, (n * 9) // 10)
+            return max(MIN_RELAY_FEE, fees_sorted[idx])
+        else:
+            idx = n // 2
+            return max(MIN_RELAY_FEE, fees_sorted[idx])
+
+    def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
         if tx.get("txid") != txid(tx):
             return False, "txid invalido"
         if not tx["inputs"] or not tx["outputs"]:
-            return False, "tx sem inputs ou outputs"
+            return False, "tx sem inputs/outputs"
         if tx["inputs"][0]["txid"] == "0" * 64:
             return False, "coinbase invalida"
+
+        # ✅ v5: Verifica nonce (protecao replay)
+        for inp in tx["inputs"]:
+            pk = inp.get("pubkey", "")
+            if pk:
+                expected = self.db.get_nonce_for_pubkey(pk)
+                tx_nonce = tx.get("nonce", 0)
+                if tx_nonce != expected:
+                    return False, f"nonce invalido (esperado {expected}, recebido {tx_nonce})"
+
         in_sum = 0
         seen = set()
         for inp in tx["inputs"]:
@@ -184,18 +214,22 @@ class Blockchain:
             if not u:
                 return False, "UTXO inexistente"
             if u["pubkey"] and inp.get("pubkey", "") != u["pubkey"]:
-                return False, "pubkey nao corresponde"
+                return False, "pubkey mismatch"
             in_sum += u["amount"]
+
         out_sum = sum(o["amount"] for o in tx["outputs"])
         if out_sum > in_sum:
             return False, "outputs > inputs"
+        if in_sum - out_sum < MIN_RELAY_FEE:
+            return False, "fee abaixo do minimo"
+
         sig_hash = signing_hash(tx)
         for inp in tx["inputs"]:
             if not Wallet.verify(sig_hash, inp.get("signature", ""), inp.get("pubkey", "")):
                 return False, "assinatura invalida"
         return True, "ok"
 
-    def submit_tx(self, tx: dict):
+    def submit_tx(self, tx):
         if self.db.has_mempool(tx["txid"]):
             return False, "ja na mempool"
         ok, msg = self.validate_tx(tx)
@@ -208,7 +242,7 @@ class Blockchain:
             return False, "falha na mempool"
         return True, tx["txid"]
 
-    def tx_fee(self, tx: dict) -> int:
+    def tx_fee(self, tx):
         in_sum = 0
         for inp in tx["inputs"]:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
@@ -216,7 +250,7 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
-    def validate_block(self, block: dict, prev_block: dict = None):
+    def validate_block(self, block, prev_block=None):
         if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
             return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
@@ -224,8 +258,7 @@ class Blockchain:
             return False, "altura invalida"
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
-        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
-                       block["nonce"], block["difficulty"])
+        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"], block["nonce"], block["difficulty"])
         if h != block["hash"]:
             return False, "hash incorreto"
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
@@ -247,7 +280,7 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
-    def accept_block(self, block: dict):
+    def accept_block(self, block):
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev)
         if not ok:
@@ -259,7 +292,63 @@ class Blockchain:
                 self.db.remove_mempool(t["txid"])
         return True, block["hash"]
 
-    def mine_block(self, miner_address: str):
+    def reorg_to(self, new_blocks):
+        if not new_blocks:
+            return False, "lista vazia"
+        fork_height = -1
+        for i, b in enumerate(new_blocks):
+            local = self.db.get_block(b["height"])
+            if local and local["hash"] == b["hash"]:
+                fork_height = b["height"]
+            else:
+                break
+        if fork_height < 0:
+            return False, "nenhum ponto em comum"
+        blocks_to_add = [b for b in new_blocks if b["height"] > fork_height]
+        if not blocks_to_add:
+            return False, "nada novo"
+        work_alt = self.cumulative_work_of_chain(blocks_to_add)
+        work_local = 0
+        for h in range(fork_height + 1, self.db.height() + 1):
+            b = self.db.get_block(h)
+            if b:
+                work_local += work_from_difficulty(b["difficulty"])
+        if work_alt <= work_local:
+            return False, "local tem mais trabalho"
+        depth = self.db.height() - fork_height
+        if depth > MAX_REORG_DEPTH:
+            return False, "reorg muito profundo"
+        print(f"[REORG] fork #{fork_height}, -{depth}, +{len(blocks_to_add)}")
+        prev = self.db.get_block(fork_height) if fork_height >= 0 else None
+        for b in blocks_to_add:
+            ok, msg = self.validate_block(b, prev)
+            if not ok:
+                return False, f"bloco #{b['height']}: {msg}"
+            prev = b
+        backups = []
+        for h in range(fork_height + 1, self.db.height() + 1):
+            b = self.db.get_block(h)
+            if b:
+                backups.append(b)
+        try:
+            self.db.delete_blocks_above(fork_height)
+        except Exception as e:
+            return False, f"falha ao deletar: {e}"
+        for b in blocks_to_add:
+            ok, msg = self.accept_block(b)
+            if not ok:
+                print(f"[REORG] falha em #{b['height']}, restaurando...")
+                self.db.delete_blocks_above(fork_height)
+                for backup in backups:
+                    try:
+                        self.accept_block(backup)
+                    except Exception:
+                        pass
+                return False, f"falha no reorg: {msg}"
+        print(f"[REORG] concluido! Altura: {self.db.height()}")
+        return True, f"reorg ok ({len(blocks_to_add)} blocos)"
+
+    def mine_block(self, miner_address):
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -277,15 +366,12 @@ class Blockchain:
             nonce += 1
             if nonce % 200000 == 0:
                 ts = int(time.time())
-        block = {
-            "height": height, "hash": h, "prev_hash": prev_hash,
-            "timestamp": ts, "nonce": nonce, "merkle": merkle,
-            "difficulty": diff, "transactions": txs,
-        }
+        block = {"height": height, "hash": h, "prev_hash": prev_hash, "timestamp": ts,
+                 "nonce": nonce, "merkle": merkle, "difficulty": diff, "transactions": txs}
         ok, msg = self.accept_block(block)
         return block if ok else None
 
-    def mine_block_interruptible(self, miner_address: str, should_continue):
+    def mine_block_interruptible(self, miner_address, should_continue):
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -305,11 +391,8 @@ class Blockchain:
             nonce += 1
             if nonce % 50000 == 0:
                 ts = int(time.time())
-        block = {
-            "height": height, "hash": h, "prev_hash": prev_hash,
-            "timestamp": ts, "nonce": nonce, "merkle": merkle,
-            "difficulty": diff, "transactions": txs,
-        }
+        block = {"height": height, "hash": h, "prev_hash": prev_hash, "timestamp": ts,
+                 "nonce": nonce, "merkle": merkle, "difficulty": diff, "transactions": txs}
         ok, msg = self.accept_block(block)
         return block if ok else None
 
@@ -317,7 +400,7 @@ class Blockchain:
 try:
     from chain_validator import verify_chain as _verify_ext
 
-    def _verify_chain_method(self, full: bool = True):
+    def _verify_chain_method(self, full=True):
         return _verify_ext(self)
 
     Blockchain.verify_chain = _verify_chain_method
