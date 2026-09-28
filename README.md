@@ -1,3 +1,6 @@
+explorador de bloco http://127.0.0.1:8080/
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/13a27a35-15c4-49b3-99fd-6fdd9a10c998" />
+
 <img width="960" height="448" alt="image" src="https://github.com/user-attachments/assets/aab954b9-bbaa-429d-b9cb-282efcad2bf6" />
 
 📄 Documento de Testes — BRN Node v4
