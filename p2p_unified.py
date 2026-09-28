@@ -808,3 +808,37 @@ class P2PManager:
             h = block_dict.get("height", -1)
             if h > self.bc.db.height():
                 self.bc.db.add_block(block_dict)
+                print(f"📦 [P2P] Novo bloco recebido: #{h}")
+                return True
+        except Exception as e:
+            print(f"⚠️ [P2P] Erro ao processar bloco: {e}")
+        return False
+
+    def _on_new_tx(self, tx_dict: dict) -> bool:
+        try:
+            ok, msg = self.bc.submit_tx(tx_dict)
+            if ok:
+                print(f"💸 [P2P] Nova tx: {tx_dict.get('txid', '?')[:16]}…")
+            return ok
+        except Exception as e:
+            print(f"⚠️ [P2P] Erro ao processar tx: {e}")
+            return False
+
+    def get_status(self) -> dict:
+        peers = self.discovery.listar_peers()
+        return {
+            "node_id": self.node_uuid,
+            "port": self.tcp_port,
+            "external_ip": self.external_ip,
+            "peer_count": len(peers),
+            "peers": peers,
+            "height": self.bc.db.height(),
+        }
+
+
+# ============================================================
+# TESTE ISOLADO
+# ============================================================
+if __name__ == "__main__":
+    print("⚠️  Rode este módulo a partir do seu nó principal (server.py).")
+    print("   O teste isolado precisa de uma instância de Blockchain.")
