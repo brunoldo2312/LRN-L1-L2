@@ -1,0 +1,358 @@
+"""
+blockchain.py — Núcleo da blockchain BRN
+================================================================
+✅ v3: verify_chain movido para chain_validator.py
+✅ v3: Hook para chain_validator plugado no final do arquivo
+================================================================
+"""
+import time
+import orjson
+from crypto import double_sha256, sha256
+from db import ChainDB
+
+COIN_NAME = "BrunoCoin"
+TICKER = "BRN"
+DECIMALS = 8
+UNIT = 10 ** DECIMALS
+
+MAX_SUPPLY = 21_000_000 * UNIT
+INITIAL_REWARD = 50 * UNIT
+HALVING_INTERVAL = 210_000
+BLOCK_TIME = 120
+DIFFICULTY_INTERVAL = 2016
+INITIAL_DIFFICULTY = 4
+MAX_TX_PER_BLOCK = 500
+
+GENESIS_PREV = "0" * 64
+GENESIS_TIMESTAMP = 1700000000
+GENESIS_REWARD = INITIAL_REWARD
+GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t3m2k7h4s6w8c9p2e"
+GENESIS_NONCE = 0
+
+
+def block_hash(prev_hash, merkle, timestamp, nonce, difficulty) -> str:
+    header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
+    return double_sha256(header.encode()).hex()
+
+
+def target_from_difficulty(difficulty: int) -> int:
+    return int("0" * difficulty + "f" * (64 - difficulty), 16)
+
+
+def meets_difficulty(h: str, difficulty: int) -> bool:
+    return int(h, 16) <= target_from_difficulty(difficulty)
+
+
+def compute_merkle_root(txids: list[str]) -> str:
+    if not txids:
+        return "0" * 64
+    layer = [bytes.fromhex(t) for t in txids]
+    while len(layer) > 1:
+        if len(layer) % 2:
+            layer.append(layer[-1])
+        layer = [sha256(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
+    return layer[0].hex()
+
+
+def make_coinbase(address: str, height: int, reward: int) -> dict:
+    cb = {
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+        "outputs": [{"address": address, "amount": reward, "pubkey": ""}],
+        "timestamp": int(time.time()),
+        "locktime": 0,
+        "height": height,
+    }
+    cb["txid"] = txid(cb)
+    return cb
+
+
+def txid(tx: dict) -> str:
+    core = {
+        "inputs": [{"txid": i["txid"], "vout": i["vout"]} for i in tx["inputs"]],
+        "outputs": tx["outputs"],
+        "timestamp": tx["timestamp"],
+        "locktime": tx.get("locktime", 0),
+    }
+    if "height" in tx:
+        core["height"] = tx["height"]
+    return double_sha256(orjson.dumps(core, option=orjson.OPT_SORT_KEYS)).hex()
+
+
+def signing_hash(tx: dict) -> bytes:
+    core = {
+        "inputs": [
+            {"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
+            for i in tx["inputs"]
+        ],
+        "outputs": tx["outputs"],
+        "timestamp": tx["timestamp"],
+        "locktime": tx.get("locktime", 0),
+    }
+    return double_sha256(orjson.dumps(core, option=orjson.OPT_SORT_KEYS))
+
+
+# ---------------- GENESIS ----------------
+def build_genesis() -> dict:
+    cb = {
+        "txid": "",
+        "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+        "outputs": [{"address": GENESIS_ADDRESS, "amount": GENESIS_REWARD, "pubkey": ""}],
+        "timestamp": GENESIS_TIMESTAMP,
+        "locktime": 0,
+        "height": 0,
+    }
+    cb["txid"] = txid(cb)
+    merkle = compute_merkle_root([cb["txid"]])
+    nonce = 0
+    while True:
+        h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
+        if h.startswith("0"):
+            break
+        nonce += 1
+    return {
+        "height": 0,
+        "hash": h,
+        "prev_hash": GENESIS_PREV,
+        "timestamp": GENESIS_TIMESTAMP,
+        "nonce": nonce,
+        "merkle": merkle,
+        "difficulty": 1,
+        "transactions": [cb],
+    }
+
+
+GENESIS_BLOCK = build_genesis()
+
+
+# ---------------- BLOCKCHAIN ----------------
+class Blockchain:
+    def __init__(self, db_path: str = "brn_v2_chain.db", genesis_address: str | None = None):
+        self.db = ChainDB(db_path)
+        if self.db.height() < 0:
+            g = GENESIS_BLOCK
+            if genesis_address:
+                g = self._genesis_with_address(genesis_address)
+            self.db.add_block(g)
+            self.db.apply_tx(g["transactions"][0], 0, coinbase=True)
+            self.db.set_meta("genesis_hash", g["hash"])
+
+    @staticmethod
+    def _genesis_with_address(address: str) -> dict:
+        cb = {
+            "txid": "",
+            "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF, "pubkey": "", "signature": ""}],
+            "outputs": [{"address": address, "amount": GENESIS_REWARD, "pubkey": ""}],
+            "timestamp": GENESIS_TIMESTAMP,
+            "locktime": 0,
+            "height": 0,
+        }
+        cb["txid"] = txid(cb)
+        merkle = compute_merkle_root([cb["txid"]])
+        nonce = 0
+        while True:
+            h = block_hash(GENESIS_PREV, merkle, GENESIS_TIMESTAMP, nonce, 1)
+            if h.startswith("0"):
+                break
+            nonce += 1
+        return {
+            "height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
+            "merkle": merkle, "difficulty": 1, "transactions": [cb],
+        }
+
+    # ---------- recompensa / difficulty ----------
+    def current_reward(self, height: int) -> int:
+        halvings = height // HALVING_INTERVAL
+        if halvings >= 64:
+            return 0
+        return INITIAL_REWARD >> halvings
+
+    def current_difficulty(self) -> int:
+        h = self.db.height()
+        if h < DIFFICULTY_INTERVAL:
+            return INITIAL_DIFFICULTY
+        start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
+        end = self.db.get_block(h)
+        if not start or not end:
+            return INITIAL_DIFFICULTY
+        actual = max(1, end["timestamp"] - start["timestamp"])
+        expected = BLOCK_TIME * DIFFICULTY_INTERVAL
+        prev = end["difficulty"]
+        new = int(prev * expected / actual)
+        new = max(prev // 4, min(prev * 4, new))
+        return max(1, new)
+
+    # ---------- transações ----------
+    def validate_tx(self, tx: dict, from_mempool: bool = False) -> tuple[bool, str]:
+        from wallet import Wallet
+        if tx.get("txid") != txid(tx):
+            return False, "txid inválido"
+        if not tx["inputs"] or not tx["outputs"]:
+            return False, "tx sem inputs ou outputs"
+        if tx["inputs"][0]["txid"] == "0" * 64:
+            return False, "coinbase em contexto inválido"
+
+        in_sum = 0
+        seen = set()
+        for inp in tx["inputs"]:
+            key = (inp["txid"], inp["vout"])
+            if key in seen:
+                return False, "input duplicado"
+            seen.add(key)
+            u = self.db.get_utxo(inp["txid"], inp["vout"])
+            if not u:
+                return False, f"UTXO inexistente {inp['txid'][:12]}"
+            if u["pubkey"] and inp.get("pubkey", "") != u["pubkey"]:
+                return False, "pubkey não corresponde ao UTXO"
+            in_sum += u["amount"]
+
+        out_sum = 0
+        for o in tx["outputs"]:
+            if o["amount"] <= 0:
+                return False, "output inválido"
+            out_sum += o["amount"]
+        if out_sum > in_sum:
+            return False, "outputs > inputs"
+
+        sig_hash = signing_hash(tx)
+        for inp in tx["inputs"]:
+            if not Wallet.verify(sig_hash, inp.get("signature", ""), inp.get("pubkey", "")):
+                return False, "assinatura inválida"
+        return True, "ok"
+
+    def submit_tx(self, tx: dict) -> tuple[bool, str]:
+        if self.db.has_mempool(tx["txid"]):
+            return False, "já na mempool"
+        ok, msg = self.validate_tx(tx)
+        if not ok:
+            return False, msg
+        fee = self.tx_fee(tx)
+        if fee < 0:
+            return False, "fee negativa"
+        if not self.db.add_mempool(tx, fee):
+            return False, "falha ao adicionar na mempool"
+        return True, tx["txid"]
+
+    def tx_fee(self, tx: dict) -> int:
+        in_sum = 0
+        for inp in tx["inputs"]:
+            u = self.db.get_utxo(inp["txid"], inp["vout"])
+            if u:
+                in_sum += u["amount"]
+        return in_sum - sum(o["amount"] for o in tx["outputs"])
+
+    # ---------- blocos ----------
+    def validate_block(self, block: dict, prev_block: dict | None = None) -> tuple[bool, str]:
+        if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
+            return False, "prev_hash não bate com o topo"
+        expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
+        if block["height"] != expected_height:
+            return False, "altura inválida"
+        if not meets_difficulty(block["hash"], block["difficulty"]):
+            return False, "PoW inválido"
+        h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
+                       block["nonce"], block["difficulty"])
+        if h != block["hash"]:
+            return False, "hash do bloco não confere"
+        if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
+            return False, "merkle root não confere"
+        cb = block["transactions"][0]
+        if cb["inputs"][0]["txid"] != "0" * 64:
+            return False, "primeira tx não é coinbase"
+        reward = self.current_reward(block["height"])
+        fees = 0
+        for i, t in enumerate(block["transactions"][1:], 1):
+            if t["txid"] != txid(t):
+                return False, f"txid inválido na posição {i}"
+            ok, msg = self.validate_tx(t)
+            if not ok:
+                return False, msg
+            fees += self.tx_fee(t)
+        total_cb = sum(o["amount"] for o in cb["outputs"])
+        if total_cb > reward + fees:
+            return False, "coinbase acima do permitido"
+        return True, "ok"
+
+    def accept_block(self, block: dict) -> tuple[bool, str]:
+        prev = self.db.get_block_by_hash(block["prev_hash"])
+        ok, msg = self.validate_block(block, prev)
+        if not ok:
+            return False, msg
+        self.db.add_block(block)
+        for i, t in enumerate(block["transactions"]):
+            self.db.apply_tx(t, block["height"], coinbase=(i == 0))
+            if i > 0:
+                self.db.remove_mempool(t["txid"])
+        return True, block["hash"]
+
+    def mine_block(self, miner_address: str) -> dict | None:
+        height = self.db.height() + 1
+        reward = self.current_reward(height)
+        diff = self.current_difficulty()
+        cb = make_coinbase(miner_address, height, reward)
+        selected = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
+        txs = [cb] + selected
+        merkle = compute_merkle_root([t["txid"] for t in txs])
+        prev_hash = self.db.tip_hash()
+        ts = int(time.time())
+        nonce = 0
+        while True:
+            h = block_hash(prev_hash, merkle, ts, nonce, diff)
+            if meets_difficulty(h, diff):
+                break
+            nonce += 1
+            if nonce % 200000 == 0:
+                ts = int(time.time())
+        block = {
+            "height": height, "hash": h, "prev_hash": prev_hash,
+            "timestamp": ts, "nonce": nonce, "merkle": merkle,
+            "difficulty": diff, "transactions": txs,
+        }
+        ok, msg = self.accept_block(block)
+        return block if ok else None
+
+    def mine_block_interruptible(self, miner_address: str, should_continue) -> dict | None:
+        """Mineração interrompível (usada pela GUI)."""
+        height = self.db.height() + 1
+        reward = self.current_reward(height)
+        diff = self.current_difficulty()
+        cb = make_coinbase(miner_address, height, reward)
+        selected = self.db.all_mempool(limit=MAX_TX_PER_BLOCK - 1)
+        txs = [cb] + selected
+        merkle = compute_merkle_root([t["txid"] for t in txs])
+        prev_hash = self.db.tip_hash()
+        ts = int(time.time())
+        nonce = 0
+        while True:
+            if should_continue is not None and not should_continue():
+                return None
+            h = block_hash(prev_hash, merkle, ts, nonce, diff)
+            if meets_difficulty(h, diff):
+                break
+            nonce += 1
+            if nonce % 50000 == 0:
+                ts = int(time.time())
+        block = {
+            "height": height, "hash": h, "prev_hash": prev_hash,
+            "timestamp": ts, "nonce": nonce, "merkle": merkle,
+            "difficulty": diff, "transactions": txs,
+        }
+        ok, msg = self.accept_block(block)
+        return block if ok else None
+
+
+# ============================================================
+# ✅ v3: Hook para chain_validator.py (SRP)
+# ============================================================
+try:
+    from chain_validator import verify_chain as _verify_ext
+
+    def _verify_chain_method(self, full: bool = True):
+        return _verify_ext(self)
+
+    Blockchain.verify_chain = _verify_chain_method
+    Blockchain.verify_chain_dict = lambda self: _verify_ext(self).to_dict()
+    print("✅ chain_validator.py plugado em Blockchain")
+except ImportError:
+    print("⚠️ chain_validator.py não encontrado — verify_chain desabilitado.")
