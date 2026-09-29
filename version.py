@@ -1,0 +1,5 @@
+"""version.py — Versão central do BRN Node."""
+VERSION     = "8.3.0"
+BUILD_DATE  = "2026-09-29"
+GITHUB_USER = "brunoldo2312"
+GITHUB_REPO = "LRN-L1-L2"
