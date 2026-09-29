@@ -1,510 +1,417 @@
 """
-db_v3.py — Banco de dados SQLite do BRN (v3)
-============================================================
-Substitui db.py com:
-  ✅ Índice adicional em transactions(txid) para busca rápida
-  ✅ Correção do rollback_block (não deleta UTXOs de coinbase corretamente)
-  ✅ Novo método get_stats() para o explorer
-  ✅ Novo método vacuum() para manutenção
-  ✅ Lock RLock em todas as operações de escrita
-  ✅ Métodos de consulta paginada (para o explorer)
-============================================================
+db_v3.py — Banco de Dados da Blockchain BRN
+Versão: 3.2 | Data: 29/09/2026
+- SQLite persistente para blocos e transações
+- Índices para consultas rápidas
+- Suporte a SPV (cabeçalhos de bloco)
+- Consulta de altura de transações para confirmações
 """
 
-import time
-import zlib
 import sqlite3
-import threading
-import orjson
+import json
+import os
+from typing import List, Dict, Optional, Tuple, Any
 
 
-class ChainDB:
-    def __init__(self, path: str):
-        self.path = path
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+DB_FILE = "brn_v2_chain.db"
+DB_TIMEOUT = 30.0
+
+
+# ============================================================
+# CLASSE PRINCIPAL DO BANCO DE DADOS
+# ============================================================
+
+class BlockchainDB:
+    def __init__(self, db_path: str = DB_FILE):
+        self.db_path = db_path
+        self.conn: Optional[sqlite3.Connection] = None
+        self._lock = False  # Controle simples de acesso
+        self.connect()
+        self.init_tables()
+
+    def connect(self) -> None:
+        """Conectar ao banco de dados"""
         self.conn = sqlite3.connect(
-            path, check_same_thread=False, isolation_level=None
+            self.db_path,
+            timeout=DB_TIMEOUT,
+            check_same_thread=False
         )
         self.conn.row_factory = sqlite3.Row
-        self.lock = threading.RLock()
+        # Melhorias de performance
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-2000")
 
-        for p in (
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA synchronous=NORMAL",
-            "PRAGMA temp_store=MEMORY",
-            "PRAGMA cache_size=-20000",
-            "PRAGMA mmap_size=268435456",
-            "PRAGMA foreign_keys=ON",
-        ):
-            self.conn.execute(p)
+    def close(self) -> None:
+        """Fechar conexão com o banco"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
 
-        self._schema()
+    # ========================================================
+    # INICIALIZAÇÃO DAS TABELAS
+    # ========================================================
 
-    def _schema(self):
-        with self.lock:
-            self.conn.executescript("""
+    def init_tables(self) -> None:
+        """Criar todas as tabelas se não existirem"""
+        cursor = self.conn.cursor()
+
+        # Tabela de Blocos
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS blocks (
-                height     INTEGER PRIMARY KEY,
-                hash       TEXT UNIQUE NOT NULL,
-                prev_hash  TEXT NOT NULL,
-                timestamp  INTEGER NOT NULL,
-                nonce      INTEGER NOT NULL,
-                merkle     TEXT NOT NULL,
+                height INTEGER PRIMARY KEY,
+                hash TEXT UNIQUE NOT NULL,
+                previous_hash TEXT NOT NULL,
+                merkle_root TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
                 difficulty INTEGER NOT NULL,
-                raw        BLOB NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
-            CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
+                nonce INTEGER NOT NULL,
+                cumulative_work INTEGER DEFAULT 0,
+                transactions TEXT NOT NULL DEFAULT '[]'
+            ) WITHOUT ROWID;
+        """)
 
+        # Tabela de Transações
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                txid         TEXT PRIMARY KEY,
-                block_height INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_height);
-
-            CREATE TABLE IF NOT EXISTS utxos (
-                txid         TEXT NOT NULL,
-                vout         INTEGER NOT NULL,
-                address      TEXT NOT NULL,
-                amount       INTEGER NOT NULL,
-                pubkey       TEXT NOT NULL,
+                txid TEXT PRIMARY KEY,
                 block_height INTEGER NOT NULL,
-                spent        INTEGER NOT NULL DEFAULT 0,
-                spent_by     TEXT,
-                PRIMARY KEY (txid, vout)
-            );
-            CREATE INDEX IF NOT EXISTS idx_utxo_addr  ON utxos(address, spent);
-            CREATE INDEX IF NOT EXISTS idx_utxo_spent ON utxos(spent);
-            CREATE INDEX IF NOT EXISTS idx_utxo_h     ON utxos(block_height);
+                tipo TEXT NOT NULL,
+                de TEXT NOT NULL,
+                para TEXT NOT NULL,
+                valor REAL NOT NULL,
+                taxa REAL DEFAULT 0,
+                timestamp INTEGER NOT NULL,
+                assinatura TEXT,
+                dados TEXT,
+                FOREIGN KEY (block_height) REFERENCES blocks(height)
+            ) WITHOUT ROWID;
+        """)
 
-            CREATE TABLE IF NOT EXISTS mempool (
-                txid        TEXT PRIMARY KEY,
-                raw         BLOB NOT NULL,
-                fee         INTEGER NOT NULL,
-                received_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_mp_fee  ON mempool(fee DESC);
-            CREATE INDEX IF NOT EXISTS idx_mp_time ON mempool(received_at);
+        # Tabela de Cabeçalhos de Blocos (para modo SPV / Nó Leve)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS block_headers (
+                height INTEGER PRIMARY KEY,
+                block_hash TEXT NOT NULL UNIQUE,
+                prev_hash TEXT NOT NULL,
+                merkle_root TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            ) WITHOUT ROWID;
+        """)
 
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
+        # Índices para consultas rápidas
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tx_address ON transactions(de, para);
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_height);
+        """)
 
-            CREATE TABLE IF NOT EXISTS peers (
-                address      TEXT PRIMARY KEY NOT NULL,
-                node_id      TEXT NOT NULL,
-                genesis_hash TEXT NOT NULL,
-                version      TEXT,
-                height       INTEGER DEFAULT 0,
-                is_miner     INTEGER DEFAULT 0,
-                public_key   TEXT,
-                metadata     TEXT,
-                first_seen   INTEGER NOT NULL,
-                last_seen    INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);
-            CREATE INDEX IF NOT EXISTS idx_peers_genesis   ON peers(genesis_hash);
-            CREATE INDEX IF NOT EXISTS idx_peers_node_id   ON peers(node_id);
+        self.conn.commit()
 
-            CREATE TABLE IF NOT EXISTS network_events (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp    INTEGER NOT NULL,
-                event_type   TEXT NOT NULL,
-                peer_address TEXT,
-                details      TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_events_ts ON network_events(timestamp DESC);
-            """)
+    # ========================================================
+    # OPERAÇÕES COM BLOCOS
+    # ========================================================
 
-    # ==================== BLOCOS ====================
-    def add_block(self, block: dict):
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                blob = zlib.compress(orjson.dumps(block), level=6)
-                self.conn.execute(
-                    "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (block["height"], block["hash"], block["prev_hash"],
-                     block["timestamp"], block["nonce"], block["merkle"],
-                     block["difficulty"], blob),
-                )
-                for tx in block["transactions"]:
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO transactions(txid,block_height) VALUES (?,?)",
-                        (tx["txid"], block["height"]),
-                    )
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    def accept_block_atomic(self, block: dict):
-        """Aceita o bloco INTEIRO em uma única transação SQL (atômico)."""
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                blob = zlib.compress(orjson.dumps(block), level=6)
-                self.conn.execute(
-                    "INSERT INTO blocks(height,hash,prev_hash,timestamp,nonce,merkle,difficulty,raw)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (block["height"], block["hash"], block["prev_hash"],
-                     block["timestamp"], block["nonce"], block["merkle"],
-                     block["difficulty"], blob),
-                )
-
-                for i, tx in enumerate(block["transactions"]):
-                    is_coinbase = (i == 0)
-
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO transactions(txid,block_height) VALUES (?,?)",
-                        (tx["txid"], block["height"]),
-                    )
-
-                    if not is_coinbase:
-                        for inp in tx["inputs"]:
-                            self.conn.execute(
-                                "UPDATE utxos SET spent=1, spent_by=? "
-                                "WHERE txid=? AND vout=? AND spent=0",
-                                (tx["txid"], inp["txid"], inp["vout"]),
-                            )
-
-                    for j, out in enumerate(tx["outputs"]):
-                        self.conn.execute(
-                            "INSERT OR REPLACE INTO utxos"
-                            "(txid,vout,address,amount,pubkey,block_height,spent)"
-                            " VALUES (?,?,?,?,?,?,0)",
-                            (tx["txid"], j, out["address"], out["amount"],
-                             out.get("pubkey", ""), block["height"]),
-                        )
-
-                    self.conn.execute("DELETE FROM mempool WHERE txid=?", (tx["txid"],))
-
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    def get_block(self, height: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT raw FROM blocks WHERE height=?", (height,)
-        ).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
-
-    def get_block_by_hash(self, h: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT raw FROM blocks WHERE hash=?", (h,)
-        ).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
-
-    def height(self) -> int:
-        row = self.conn.execute("SELECT MAX(height) AS h FROM blocks").fetchone()
-        return int(row["h"]) if row and row["h"] is not None else -1
-
-    def tip(self) -> dict | None:
-        row = self.conn.execute(
-            "SELECT hash,prev_hash FROM blocks ORDER BY height DESC LIMIT 1"
-        ).fetchone()
-        return dict(row) if row else None
-
-    def tip_hash(self) -> str:
-        t = self.tip()
-        return t["hash"] if t else "0" * 64
-
-    def headers(self, start: int, limit: int = 2000) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT height,hash,prev_hash,timestamp,nonce,merkle,difficulty"
-            " FROM blocks WHERE height>=? ORDER BY height LIMIT ?",
-            (start, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def latest_blocks(self, n: int = 10) -> list[dict]:
-        """✅ NOVO: últimos N blocos (útil para o explorer)."""
-        top = self.height()
-        if top < 0:
-            return []
-        out = []
-        for h in range(max(0, top - n + 1), top + 1):
-            b = self.get_block(h)
-            if b:
-                out.append(b)
-        return out
-
-    # ==================== UTXO ====================
-    def balance(self, address: str) -> int:
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(amount),0) AS s FROM utxos WHERE address=? AND spent=0",
-            (address,),
-        ).fetchone()
-        return int(row["s"])
-
-    def utxos_for(self, address: str) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT txid,vout,amount,pubkey FROM utxos"
-            " WHERE address=? AND spent=0 ORDER BY amount DESC",
-            (address,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_utxo(self, txid: str, vout: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT * FROM utxos WHERE txid=? AND vout=? AND spent=0", (txid, vout)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def apply_tx(self, tx: dict, height: int, coinbase: bool = False):
-        with self.lock:
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                if not coinbase:
-                    for inp in tx["inputs"]:
-                        self.conn.execute(
-                            "UPDATE utxos SET spent=1, spent_by=? "
-                            "WHERE txid=? AND vout=? AND spent=0",
-                            (tx["txid"], inp["txid"], inp["vout"]),
-                        )
-                for i, out in enumerate(tx["outputs"]):
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO utxos"
-                        "(txid,vout,address,amount,pubkey,block_height,spent)"
-                        " VALUES (?,?,?,?,?,?,0)",
-                        (tx["txid"], i, out["address"], out["amount"],
-                         out.get("pubkey", ""), height),
-                    )
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    def rollback_block(self, height: int):
-        """✅ CORRIGIDO: preserva UTXOs criados por outros blocos."""
-        with self.lock:
-            block = self.get_block(height)
-            if not block:
-                return
-
-            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
-            try:
-                for tx in reversed(block["transactions"]):
-                    for i in range(len(tx["outputs"])):
-                        self.conn.execute(
-                            "DELETE FROM utxos WHERE txid=? AND vout=?",
-                            (tx["txid"], i),
-                        )
-                    if height > 0:
-                        for inp in tx.get("inputs", []):
-                            if inp["txid"] == "0" * 64:
-                                continue
-                            self.conn.execute(
-                                "UPDATE utxos SET spent=0, spent_by=NULL "
-                                "WHERE txid=? AND vout=?",
-                                (inp["txid"], inp["vout"]),
-                            )
-                    self.conn.execute(
-                        "DELETE FROM transactions WHERE txid=?", (tx["txid"],)
-                    )
-                self.conn.execute("DELETE FROM blocks WHERE height=?", (height,))
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
-
-    # ==================== MEMPOOL ====================
-    def add_mempool(self, tx: dict, fee: int) -> bool:
-        with self.lock:
-            try:
-                self.conn.execute(
-                    "INSERT INTO mempool(txid,raw,fee,received_at) VALUES (?,?,?,?)",
-                    (tx["txid"], zlib.compress(orjson.dumps(tx)), fee, time.time()),
-                )
-            except sqlite3.IntegrityError:
-                return False
-            self._prune_mempool()
-            return True
-
-    def _prune_mempool(self, max_size: int = 1000, ttl: int = 3600):
-        self.conn.execute(
-            "DELETE FROM mempool WHERE received_at < ?", (time.time() - ttl,)
-        )
-        n = self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
-        if n > max_size:
-            self.conn.execute("""
-                DELETE FROM mempool WHERE txid IN (
-                    SELECT txid FROM mempool ORDER BY fee ASC, received_at ASC LIMIT ?
-                )
-            """, (n - max_size,))
-
-    def has_mempool(self, txid: str) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM mempool WHERE txid=?", (txid,)
-        ).fetchone() is not None
-
-    def get_mempool_tx(self, txid: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT raw FROM mempool WHERE txid=?", (txid,)
-        ).fetchone()
-        return orjson.loads(zlib.decompress(row["raw"])) if row else None
-
-    def all_mempool(self, limit: int = 1000) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT raw FROM mempool ORDER BY fee DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [orjson.loads(zlib.decompress(r["raw"])) for r in rows]
-
-    def remove_mempool(self, txid: str):
-        with self.lock:
-            self.conn.execute("DELETE FROM mempool WHERE txid=?", (txid,))
-
-    def mempool_count(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) AS c FROM mempool").fetchone()["c"]
-
-    # ==================== ESTATÍSTICAS (NOVO) ====================
-    def get_stats(self) -> dict:
-        """✅ NOVO: estatísticas agregadas para o explorer."""
-        return {
-            "height": self.height(),
-            "tip_hash": self.tip_hash(),
-            "utxos": self.count_utxos(),
-            "mempool": self.mempool_count(),
-            "blocks": self.height() + 1,
-        }
-
-    # ==================== PODA / SNAPSHOT ====================
-    def prune_spent_utxos(self, keep_height: int = 1000) -> int:
-        cutoff = max(0, self.height() - keep_height)
-        with self.lock:
-            n = self.conn.execute(
-                "DELETE FROM utxos WHERE spent=1 AND block_height < ?", (cutoff,)
-            ).rowcount
-        return n
-
-    def snapshot_utxo(self, path: str = "utxo_snapshot.db"):
-        with self.lock:
-            snap = sqlite3.connect(path)
-            snap.execute("DROP TABLE IF EXISTS utxos")
-            snap.execute("CREATE TABLE utxos AS SELECT * FROM utxos WHERE spent=0")
-            snap.commit()
-            snap.close()
-
-    def count_utxos(self) -> int:
-        return self.conn.execute(
-            "SELECT COUNT(*) AS c FROM utxos WHERE spent=0"
-        ).fetchone()["c"]
-
-    def vacuum(self):
-        """✅ NOVO: compacta o arquivo SQLite (rodar após prune)."""
-        with self.lock:
-            self.conn.execute("VACUUM")
-
-    # ==================== META ====================
-    def set_meta(self, key: str, value: str):
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value)
-            )
-
-    def get_meta(self, key: str) -> str | None:
-        row = self.conn.execute(
-            "SELECT value FROM meta WHERE key=?", (key,)
-        ).fetchone()
-        return row["value"] if row else None
-
-    # ==================== PEERS ====================
-    def upsert_peer(self, node_id: str, address: str, genesis_hash: str,
-                    version: str = "?", height: int = 0,
-                    is_miner: bool = False, public_key: str = "",
-                    metadata: dict | None = None) -> bool:
-        with self.lock:
-            agora = int(time.time())
-            existente = self.conn.execute(
-                "SELECT node_id FROM peers WHERE address=?", (address,)
-            ).fetchone()
-            novo = existente is None
-            node_id_antigo = existente["node_id"] if existente else None
-
-            self.conn.execute("""
-                INSERT INTO peers
-                    (address, node_id, genesis_hash, version, height,
-                     is_miner, public_key, metadata, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(address) DO UPDATE SET
-                    node_id      = excluded.node_id,
-                    genesis_hash = excluded.genesis_hash,
-                    version      = excluded.version,
-                    height       = excluded.height,
-                    is_miner     = excluded.is_miner,
-                    public_key   = excluded.public_key,
-                    metadata     = excluded.metadata,
-                    last_seen    = excluded.last_seen
+    def save_block(self, block_data: Dict) -> bool:
+        """Salvar um bloco completo no banco"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO blocks
+                (height, hash, previous_hash, merkle_root,
+                 timestamp, difficulty, nonce, cumulative_work, transactions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                address, node_id, genesis_hash, version, height,
-                1 if is_miner else 0, public_key,
-                orjson.dumps(metadata or {}).decode(),
-                agora, agora
+                block_data["index"],
+                block_data["hash"],
+                block_data["previous_hash"],
+                block_data["merkle_root"],
+                int(block_data["timestamp"]),
+                block_data["difficulty"],
+                block_data["nonce"],
+                block_data.get("cumulative_work", 0),
+                json.dumps(block_data["transactions"])
             ))
 
-            if novo:
-                self._log_event("peer_joined", address, f"node_id={node_id[:12]}…")
-            elif node_id_antigo and node_id_antigo != node_id:
-                self._log_event("peer_node_changed", address,
-                                f"{node_id_antigo[:12]}… → {node_id[:12]}…")
-
-            return novo
-
-    def listar_peers(self, apenas_ativos: bool = True, janela: int = 300) -> list[dict]:
-        if apenas_ativos:
-            cutoff = int(time.time()) - janela
-            rows = self.conn.execute(
-                "SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC",
-                (cutoff,)
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM peers ORDER BY last_seen DESC"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def contar_peers(self, apenas_ativos: bool = True, janela: int = 300) -> int:
-        if apenas_ativos:
-            cutoff = int(time.time()) - janela
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM peers WHERE last_seen >= ?", (cutoff,)
-            ).fetchone()
-        else:
-            row = self.conn.execute("SELECT COUNT(*) AS n FROM peers").fetchone()
-        return int(row["n"])
-
-    def remover_peer(self, node_id: str):
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE node_id=?", (node_id,))
-
-    def remover_peer_por_endereco(self, address: str):
-        with self.lock:
-            self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
-
-    def limpar_peers_inativos(self, janela: int = 1800):
-        with self.lock:
-            self.conn.execute(
-                "DELETE FROM peers WHERE last_seen < ?",
-                (int(time.time()) - janela,)
+            # Salvar também os cabeçalhos para modo SPV
+            self.save_header(
+                block_data["index"],
+                block_data["hash"],
+                block_data["previous_hash"],
+                block_data["merkle_root"],
+                int(block_data["timestamp"])
             )
 
-    # ==================== EVENTOS ====================
-    def _log_event(self, tipo: str, peer: str = "", details: str = ""):
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO network_events (timestamp, event_type, peer_address, details) "
-                "VALUES (?,?,?,?)",
-                (int(time.time()), tipo, peer, details)
-            )
+            # Salvar cada transação
+            for tx in block_data["transactions"]:
+                self.save_transaction(tx, block_data["index"])
 
-    def ultimos_eventos(self, n: int = 50) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro ao salvar bloco: {e}")
+            self.conn.rollback()
+            return False
 
-    # ==================== CLOSE ====================
-    def close(self):
-        self.conn.close()
+    def save_header(self, height: int, block_hash: str,
+                    prev_hash: str, merkle_root: str, timestamp: int) -> None:
+        """Salvar apenas cabeçalho do bloco (modo SPV)"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO block_headers
+                (height, block_hash, prev_hash, merkle_root, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (height, block_hash, prev_hash, merkle_root, timestamp))
+            self.conn.commit()
+        except Exception as e:
+            print(f"[DB] Erro ao salvar cabeçalho: {e}")
+
+    def get_latest_block(self) -> Optional[Dict]:
+        """Obter o bloco mais recente da cadeia"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM blocks ORDER BY height DESC LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_block(row)
+        except Exception as e:
+            print(f"[DB] Erro ao buscar último bloco: {e}")
+            return None
+
+    def get_block(self, height: int) -> Optional[Dict]:
+        """Buscar bloco por altura"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM blocks WHERE height = ?", (height,))
+            row = cursor.fetchone()
+            return self._row_to_block(row) if row else None
+        except Exception as e:
+            print(f"[DB] Erro ao buscar bloco: {e}")
+            return None
+
+    def get_block_by_hash(self, block_hash: str) -> Optional[Dict]:
+        """Buscar bloco por hash"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM blocks WHERE hash = ?", (block_hash,))
+            row = cursor.fetchone()
+            return self._row_to_block(row) if row else None
+        except Exception as e:
+            print(f"[DB] Erro ao buscar bloco por hash: {e}")
+            return None
+
+    def get_chain_height(self) -> int:
+        """Retornar altura atual da cadeia"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT MAX(height) FROM blocks")
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else 0
+        except Exception as e:
+            print(f"[DB] Erro ao obter altura: {e}")
+            return 0
+
+    def get_all_blocks(self, limit: int = 100, offset: int = 0) -> List[Dict]:
+        """Listar blocos com paginação"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM blocks
+                ORDER BY height DESC LIMIT ? OFFSET ?
+            """, (limit, offset))
+            return [self._row_to_block(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[DB] Erro ao listar blocos: {e}")
+            return []
+
+    def _row_to_block(self, row: sqlite3.Row) -> Dict:
+        """Converter linha do banco em dicionário de bloco"""
+        return {
+            "index": row["height"],
+            "hash": row["hash"],
+            "previous_hash": row["previous_hash"],
+            "merkle_root": row["merkle_root"],
+            "timestamp": row["timestamp"],
+            "difficulty": row["difficulty"],
+            "nonce": row["nonce"],
+            "cumulative_work": row["cumulative_work"],
+            "transactions": json.loads(row["transactions"])
+        }
+
+    # ========================================================
+    # OPERAÇÕES COM TRANSAÇÕES
+    # ========================================================
+
+    def save_transaction(self, tx: Dict, block_height: int) -> bool:
+        """Salvar uma transação"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO transactions
+                (txid, block_height, tipo, de, para, valor,
+                 taxa, timestamp, assinatura, dados)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tx.get("txid"),
+                block_height,
+                tx.get("tipo", "transfer"),
+                tx.get("de"),
+                tx.get("para"),
+                tx.get("valor", 0),
+                tx.get("taxa", 0),
+                int(tx.get("timestamp", 0)),
+                tx.get("assinatura"),
+                json.dumps(tx.get("dados", {})) if tx.get("dados") else None
+            ))
+            return True
+        except Exception as e:
+            print(f"[DB] Erro ao salvar transação: {e}")
+            return False
+
+    def get_transaction(self, txid: str) -> Optional[Dict]:
+        """Buscar transação por TXID"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM transactions WHERE txid = ?", (txid,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            print(f"[DB] Erro ao buscar transação: {e}")
+            return None
+
+    def get_tx_block_height(self, txid: str) -> int:
+        """
+        Descobre em qual altura de bloco uma transação foi incluída
+        Retorna -1 se não encontrada
+        """
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT block_height FROM transactions 
+                WHERE txid = ? LIMIT 1
+            """, (txid,))
+            row = cursor.fetchone()
+            return row[0] if row else -1
+        except Exception as e:
+            print(f"[DB] Erro ao buscar altura da transação: {e}")
+            return -1
+
+    def get_transactions_by_address(self, address: str,
+                                     limit: int = 50) -> List[Dict]:
+        """Histórico de transações de um endereço"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM transactions
+                WHERE de = ? OR para = ?
+                ORDER BY timestamp DESC LIMIT ?
+            """, (address, address, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[DB] Erro ao buscar transações do endereço: {e}")
+            return []
+
+    def get_transactions_by_block(self, block_height: int) -> List[Dict]:
+        """Buscar todas as transações de um bloco"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM transactions WHERE block_height = ?
+            """, (block_height,))
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[DB] Erro ao buscar transações do bloco: {e}")
+            return []
+
+    # ========================================================
+    # INFORMAÇÕES E ESTATÍSTICAS
+    # ========================================================
+
+    def get_total_transactions(self) -> int:
+        """Contar total de transações na rede"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM transactions")
+            row = cursor.fetchone()
+            return row[0] if row else 0
+        except Exception as e:
+            print(f"[DB] Erro ao contar transações: {e}")
+            return 0
+
+    def get_balance(self, address: str) -> float:
+        """Calcular saldo de um endereço"""
+        try:
+            cursor = self.conn.cursor()
+            # Entradas (recebido)
+            cursor.execute("""
+                SELECT COALESCE(SUM(valor), 0) FROM transactions WHERE para = ?
+            """, (address,))
+            received = cursor.fetchone()[0]
+
+            # Saídas (enviado + taxas pagas)
+            cursor.execute("""
+                SELECT COALESCE(SUM(valor + taxa), 0) FROM transactions WHERE de = ?
+            """, (address,))
+            sent = cursor.fetchone()[0]
+
+            return received - sent
+        except Exception as e:
+            print(f"[DB] Erro ao calcular saldo: {e}")
+            return 0.0
+
+    def chain_validity_check(self) -> Tuple[bool, int]:
+        """Verificar integridade da cadeia inteira"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT height, hash, previous_hash FROM blocks ORDER BY height")
+            rows = cursor.fetchall()
+
+            if not rows:
+                return True, 0  # Cadeia vazia = válida
+
+            prev_hash = rows[0]["hash"]
+            for i in range(1, len(rows)):
+                if rows[i]["previous_hash"] != prev_hash:
+                    return False, rows[i]["height"]
+                prev_hash = rows[i]["hash"]
+
+            return True, len(rows) - 1
+        except Exception as e:
+            print(f"[DB] Erro na verificação de cadeia: {e}")
+            return False, -1
+
+    # ========================================================
+    # MANUTENÇÃO
+    # ========================================================
+
+    def clear_chain(self) -> bool:
+        """⚠️ APAGA TODA A CADEIA — Usar com cuidado!"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM transactions")
+            cursor.execute("DELETE FROM blocks")
+            cursor.execute("DELETE FROM block_headers")
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro ao limpar cadeia: {e}")
+            return False
+
+    def backup_database(self, backup_path: str) -> bool:
+        """Criar cópia de segurança do banco"""
+        try:
+            if os.path.exists(self.db_path):
+                import shutil
+                shutil.copy2(self.db_path, backup_path)
+                return True
+            return False
+        except Exception as e:
+            print(f"[DB] Erro no backup: {e}")
+            return False
