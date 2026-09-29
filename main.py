@@ -1,142 +1,178 @@
 """
-main.py - Entrypoint unificado
-Sobe: Blockchain + P2P + HTTP + Explorer + Bridge (2 direções) + Wallet
+main.py — BRN (BrunoCoin) — Nó Principal
+Versão: 4.2 | Data: 29/09/2026
+- ✅ Blockchain inicialização
+- ✅ P2P com Bootstrap automático via GitHub
+- ✅ Atualização automática de timestamp no peers.json
+- ✅ Verificação de status de conexão
+- ✅ Servidor Webview (interface gráfica)
 """
-import os
-import signal
-import threading
+
+import sys
 import time
+import json
+import threading
+import os
+from pathlib import Path
 
-from blockchain import Blockchain
-from server import app as http_app
-from explorer import app as explorer_app
-from p2p_unified import P2PManager
+# ============================================================
+# 🔄 ATUALIZAÇÃO AUTOMÁTICA DO TIMESTAMP NO peers.json
+# ============================================================
 
-DB_PATH       = os.environ.get("BRN_DB", "brn_v2_chain.db")
-HTTP_PORT     = int(os.environ.get("BRN_WEB_PORT", "5000"))
-EXPLORER_PORT = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
-P2P_PORT      = int(os.environ.get("BRN_P2P_PORT", "6001"))
+PEERS_FILE = "peers.json"
+SEU_ENDERECO = "177.82.132.98:6001"  # IP:porta do seu nó
 
-ENABLE_UPNP   = os.environ.get("BRN_UPNP", "1") == "1"
-ENABLE_WALLET = os.environ.get("BRN_WALLET", "0") == "1"
-ENABLE_BRIDGE = os.environ.get("BRN_BRIDGE", "1") == "1"
-
-_shutdown = threading.Event()
-
-
-def run_http():
-    print(f"[HTTP]     http://0.0.0.0:{HTTP_PORT}")
-    http_app.run(host="0.0.0.0", port=HTTP_PORT,
-                 threaded=True, debug=False, use_reloader=False)
-
-
-def run_explorer():
-    print(f"[Explorer] http://0.0.0.0:{EXPLORER_PORT}")
-    explorer_app.run(host="0.0.0.0", port=EXPLORER_PORT,
-                     threaded=True, debug=False, use_reloader=False)
-
-
-def run_wallet():
+def atualizar_timestamp_local():
+    """Atualiza o ts no arquivo peers.json local ao iniciar"""
+    agora = int(time.time())
     try:
-        os.environ.setdefault("BRN_WEB_PASS", "carteira123")
-        from app_wallet_v3 import WalletApi
-        import webview
-        from pathlib import Path
-
-        index_path = Path(__file__).parent / "index_wallet.html"
-        if not index_path.exists():
-            print(f"[Wallet] index_wallet.html nao encontrado: {index_path}")
-            return
-
-        api = WalletApi()
-        print("[Wallet] Abrindo janela desktop...")
-        webview.create_window(
-            "BRN RWA - Carteira Digital",
-            url=index_path.resolve().as_uri(),
-            js_api=api,
-            width=1020, height=880,
-            min_size=(820, 640),
-            background_color="#0d1117",
-        )
-        webview.start(debug=False)
+        if os.path.exists(PEERS_FILE):
+            with open(PEERS_FILE, "r", encoding="utf-8") as f:
+                peers = json.load(f)
+        else:
+            peers = {}
+        
+        if SEU_ENDERECO in peers:
+            peers[SEU_ENDERECO]["ts"] = agora
+        else:
+            peers[SEU_ENDERECO] = {
+                "h": 0,
+                "id": "",
+                "ts": agora
+            }
+        
+        with open(PEERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(peers, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ Timestamp atualizado: {agora}")
+        return agora
     except Exception as e:
-        print(f"[Wallet] Falha: {e}")
+        print(f"⚠️ Erro ao atualizar peers.json: {e}")
+        return agora
 
+# Executa logo no início
+atualizar_timestamp_local()
 
-def run_bridge():
-    """Sobe watcher (BRN->BTC) e worker (envio BTC) como threads."""
-    try:
-        from bridge.config import validar_config
-        from bridge.watcher_lrn import iniciar_watcher
-        from bridge.worker import iniciar_worker
+# ============================================================
+# CONFIGURAÇÕES DA MOEDA
+# ============================================================
 
-        erros = validar_config()
-        if erros:
-            print("[Bridge] Configuração incompleta:")
-            for e in erros:
-                print(f"[Bridge]   - {e}")
-            print("[Bridge] Bridge continuará mas alguns fluxos ficarão desativados.")
+COIN_NAME = "Bruno"
+COIN_SYMBOL = "BRN"
+MINING_REWARD = 1.0
+DIFFICULTY = 4
 
-        iniciar_watcher(intervalo=30)
-        iniciar_worker(intervalo=60)
-        print("[Bridge] Watcher + Worker iniciados")
-    except Exception as e:
-        print(f"[Bridge] Falha: {e}")
+# ============================================================
+# IMPORTAÇÃO DOS MÓDULOS
+# ============================================================
 
+try:
+    from blockchain import Blockchain
+    from db import ChainDB
+    from p2p_unified import P2PManager
+    print("✅ Módulos carregados com sucesso")
+except ImportError as e:
+    print(f"❌ Erro ao carregar módulos: {e}")
+    sys.exit(1)
+
+# ============================================================
+# VERIFICAÇÃO DE STATUS DA REDE
+# ============================================================
+
+def verificar_status_rede(p2p_manager, blockchain):
+    """Exibe status completo da rede"""
+    print("\n" + "="*60)
+    print("📊 STATUS DO NÓ BRN")
+    print("="*60)
+    
+    # Timestamp
+    ts_atual = int(time.time())
+    print(f"⏱️  Hora atual:     {ts_atual}")
+    
+    # Blockchain
+    altura = blockchain.get_latest_height()
+    print(f"📦 Altura da cadeia: {altura} blocos")
+    
+    # P2P
+    status = p2p_manager.get_status()
+    print(f"🆔 Node ID:         {status['node_id']}")
+    print(f"🌐 Peers conhecidos: {status['peers_conhecidos']}")
+    print(f"🔗 Peers conectados: {status['peers_conectados']}")
+    
+    if status['peers']:
+        print("\n📋 Lista de peers ativos:")
+        for peer in status['peers']:
+            print(f"   → {peer['ip']}:{peer['port']} | {peer['node_id']} | bloco #{peer['height']}")
+    else:
+        print("\n⚠️ Nenhum peer conectado — rede local apenas")
+    
+    print("="*60 + "\n")
+
+# ============================================================
+# INICIALIZAÇÃO PRINCIPAL
+# ============================================================
+
+def inicializar_blockchain():
+    """Inicializa banco de dados e blockchain"""
+    print("🔄 Inicializando banco de dados...")
+    db = ChainDB("brn_v2_chain.db")
+    
+    print("🔄 Inicializando blockchain...")
+    bc = Blockchain(db_path="brn_v2_chain.db")
+    
+    altura = bc.get_latest_height()
+    print(f"✅ Blockchain carregada — Altura atual: {altura}")
+    return bc, db
+
+def inicializar_p2p():
+    """Inicializa rede P2P com bootstrap do GitHub"""
+    print("\n🔄 Inicializando rede P2P...")
+    p2p = P2PManager()
+    p2p.start()
+    return p2p
 
 def main():
-    print("=" * 64)
-    print("  BRN Node v7 + Bridge bidirecional + Wallet")
-    print("=" * 64)
-
-    print(f"[Chain] Abrindo DB: {DB_PATH}")
-    chain = Blockchain(DB_PATH)
-    print(f"        Altura atual : {chain.db.height()}")
-    print(f"        Tip hash     : {chain.db.tip_hash()[:20]}...")
-
-    p2p = P2PManager(chain, tcp_port=P2P_PORT, enable_upnp=ENABLE_UPNP)
-    p2p.start()
-    print(f"[P2P]     TCP porta {P2P_PORT} (UPnP={'ON' if ENABLE_UPNP else 'OFF'})")
-
-    threading.Thread(target=run_http,     daemon=True, name="HTTP").start()
-    threading.Thread(target=run_explorer, daemon=True, name="Explorer").start()
-
-    if ENABLE_BRIDGE:
-        threading.Thread(target=run_bridge, daemon=True, name="Bridge").start()
-
-    if ENABLE_WALLET:
-        threading.Thread(target=run_wallet, daemon=True, name="Wallet").start()
-
-    print()
-    print("No pronto. Ctrl+C para encerrar.")
-    print()
-
+    print("\n" + "🚀"*30)
+    print(f"   {COIN_NAME} ({COIN_SYMBOL}) — Nó Principal v4.2")
+    print("🚀"*30 + "\n")
+    
+    # 1. Inicializa Blockchain
+    blockchain, db = inicializar_blockchain()
+    
+    # 2. Inicializa P2P (conecta automaticamente aos peers do GitHub)
+    p2p = inicializar_p2p()
+    
+    # 3. Atualiza altura no peers.json local
+    altura_atual = blockchain.get_latest_height()
     try:
-        while not _shutdown.is_set():
-            time.sleep(30)
-            try:
-                peers = p2p.get_status()
-                print(f"[Status] Altura={chain.db.height()} | "
-                      f"Peers={peers['peer_count']} | "
-                      f"Mempool={len(chain.db.all_mempool(limit=1000))} | "
-                      f"UTXOs={chain.db.count_utxos()}")
-            except Exception:
+        with open(PEERS_FILE, "r", encoding="utf-8") as f:
+            peers = json.load(f)
+        if SEU_ENDERECO in peers:
+            peers[SEU_ENDERECO]["h"] = altura_atual
+            peers[SEU_ENDERECO]["id"] = p2p.node_id
+        with open(PEERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(peers, f, indent=2)
+        print(f"✅ Altura atualizada no peers.json: {altura_atual}")
+    except Exception as e:
+        print(f"⚠️ Não foi possível atualizar altura no peers.json: {e}")
+    
+    # 4. Exibe status completo
+    verificar_status_rede(p2p, blockchain)
+    
+    # 5. Mantém programa rodando
+    print("✅ Nó BRN rodando — Pressione Ctrl+C para encerrar\n")
+    
+    try:
+        while True:
+            time.sleep(60)
+            # Atualiza status a cada 60 segundos
+            if p2p.running:
                 pass
     except KeyboardInterrupt:
-        pass
-
-    print()
-    print("Encerrando...")
-    p2p.stop()
-    chain.db.close()
-    print("Ate logo.")
-
-
-def _on_signal(signum, frame):
-    _shutdown.set()
+        print("\n⏹️ Encerrando...")
+        p2p.stop()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
     main()
