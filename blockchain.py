@@ -1,7 +1,11 @@
-"""blockchain.py — Nucleo da blockchain BRN (v5)
-v4: + cumulative_work, + reorg_to, + estimate_fee
-v5: + nonce (protecao replay) em signing_hash, txid e validate_tx
 """
+blockchain.py — Núcleo da Blockchain BRN
+Versão: 5.1 | Data: 29/09/2026
+v4: + cumulative_work, + reorg_to, + estimate_fee
+v5: + nonce (proteção replay) em signing_hash, txid e validate_tx
+v5.1: + confirmações de transação
+"""
+
 import time
 import orjson
 from crypto import double_sha256, sha256
@@ -78,7 +82,7 @@ def txid(tx):
 
 
 def signing_hash(tx):
-    """Hash que e assinado. Inclui nonce desde v5."""
+    """Hash que é assinado. Inclui nonce desde v5."""
     core = {
         "inputs": [{"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")} for i in tx["inputs"]],
         "outputs": tx["outputs"],
@@ -395,6 +399,33 @@ class Blockchain:
                  "nonce": nonce, "merkle": merkle, "difficulty": diff, "transactions": txs}
         ok, msg = self.accept_block(block)
         return block if ok else None
+
+    # ========================================================
+    # v5.1: CONFIRMAÇÕES DE TRANSAÇÃO
+    # ========================================================
+
+    def get_latest_height(self) -> int:
+        """Retorna a altura atual da cadeia"""
+        return self.db.height()
+
+    def get_transaction_block_height(self, txid: str) -> int:
+        """
+        Busca em qual altura de bloco a transação foi incluída
+        Retorna -1 se não encontrada
+        """
+        return self.db.get_tx_block_height(txid)
+
+    def count_confirmations(self, txid: str) -> int:
+        """
+        Calcula quantos blocos foram minerados DEPOIS da transação
+        = altura_atual - altura_do_bloco_da_tx
+        = 0 se ainda não foi incluída
+        """
+        tx_height = self.get_transaction_block_height(txid)
+        if tx_height == -1:
+            return 0
+        current_height = self.get_latest_height()
+        return current_height - tx_height
 
 
 try:
