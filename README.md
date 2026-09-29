@@ -1,3 +1,18 @@
+
+┌─────────────────────────────────────────────────────┐
+│ 1️⃣ Ao iniciar o programa                             │
+│     ↓                                                │
+│ 2️⃣ Baixa https://raw.githubusercontent.com/.../peers.json │
+│     ↓                                                │
+│ 3️⃣ Se falhar → usa peers.json local como fallback     │
+│     ↓                                                │
+│ 4️⃣ Filtra apenas peers atualizados na última hora     │
+│     ↓                                                │
+│ 5️⃣ Conecta automaticamente a cada um                 │
+│     ↓                                                │
+│ 6️⃣ Se desconectar → tenta reconectar a cada 5 min    │
+└─────────────────────────────────────────────────────┘
+
 carteira online file:///C:/Users/mayra/Music/LRN-L1-L2-main/wallet.html
 explorador de bloco http://127.0.0.1:8080/
 <img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/13a27a35-15c4-49b3-99fd-6fdd9a10c998" />
