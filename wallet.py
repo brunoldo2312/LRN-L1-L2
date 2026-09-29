@@ -1,15 +1,16 @@
 """
 wallet.py — Carteira BRN com Schnorr (padrão) e ECDSA (fallback)
 ================================================================
-✅ v3: Adiciona métodos públicos compatíveis com server.py e app_wallet.py
-✅ v3: Adiciona classe WalletManager (fachada para a carteira desktop)
+✅ v5: Recupera HDWalletManager (BIP39 + BIP44)
+✅ v4: Adiciona WalletManager (fachada para app_wallet.py)
 ✅ v3: Adiciona assinatura/verificação de transações BRN
 ================================================================
 """
 import json
 import base64
 import os
-import secrets
+import hashlib
+import hmac as hmac_lib
 from crypto import (
     sha256, pubkey_from_priv, sign_schnorr, verify_schnorr,
     sign_ecdsa, verify_ecdsa, generate_private_key,
@@ -19,6 +20,9 @@ from bech32 import address_from_pubkey
 SIG_MODE = "schnorr"
 
 
+# ============================================================
+# WALLET SIMPLES (chave única)
+# ============================================================
 class Wallet:
     def __init__(self, private_key_hex: str | None = None):
         if private_key_hex:
@@ -28,7 +32,6 @@ class Wallet:
         self.pub = pubkey_from_priv(self.priv)
         self.address = address_from_pubkey(self.pub)
 
-    # ---------- propriedades ----------
     @property
     def priv_hex(self) -> str:
         return self.priv.hex()
@@ -37,14 +40,12 @@ class Wallet:
     def pub_hex(self) -> str:
         return self.pub.hex()
 
-    # ✅ NOVO: métodos que server.py estava chamando
     def private_key_hex(self) -> str:
         return self.priv_hex
 
     def public_key_hex(self) -> str:
         return self.pub_hex
 
-    # ---------- assinatura ----------
     def sign(self, msg_hash: bytes) -> str:
         if SIG_MODE == "schnorr":
             return sign_schnorr(self.priv, msg_hash).hex()
@@ -61,7 +62,6 @@ class Wallet:
         except Exception:
             return False
 
-    # ---------- serialização ----------
     def to_dict(self) -> dict:
         return {
             "private_key": self.priv_hex,
@@ -73,7 +73,6 @@ class Wallet:
     def from_dict(cls, d: dict) -> "Wallet":
         return cls(private_key_hex=d["private_key"])
 
-    # ---------- criptografia local ----------
     def export_encrypted(self, password: str) -> str:
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
@@ -100,14 +99,9 @@ class Wallet:
 
 
 # ============================================================
-# ✅ NOVO: WalletManager (fachada usada pelo app_wallet.py)
+# WALLET MANAGER (fachada para app_wallet.py)
 # ============================================================
 class WalletManager:
-    """
-    Fachada estática que o app_wallet.py (desktop) usa.
-    Internamente delega para a classe Wallet.
-    """
-
     WALLETS_DIR = os.environ.get("BRN_WALLETS_DIR", "wallets")
 
     @staticmethod
@@ -116,7 +110,6 @@ class WalletManager:
 
     @staticmethod
     def generate_keypair() -> dict:
-        """Gera nova carteira. Retorna dict com address, sk, pk."""
         w = Wallet()
         return {
             "address": w.address,
@@ -126,45 +119,36 @@ class WalletManager:
 
     @staticmethod
     def validate_address(addr: str) -> bool:
-        """Valida endereço brn1... via bech32."""
         try:
             from bech32 import validate_address as _v
             return _v(addr)
         except Exception:
-            # fallback mínimo
             return isinstance(addr, str) and addr.startswith("brn1") and len(addr) > 20
 
     @staticmethod
     def save_encrypted_wallet(filename: str, password: str,
                               address: str, sk: str, pk: str) -> dict:
-        """Salva carteira cifrada em disco."""
         try:
             WalletManager._garantir_dir()
             if not filename.endswith(".wallet"):
                 filename += ".wallet"
             path = os.path.join(WalletManager.WALLETS_DIR, filename)
-
             w = Wallet(private_key_hex=sk)
             blob = w.export_encrypted(password)
-
             with open(path, "w") as f:
                 f.write(blob)
-
             return {"ok": True, "msg": f"Carteira salva em {path}", "path": path}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
     @staticmethod
     def load_encrypted_wallet(filename: str, password: str) -> dict:
-        """Carrega carteira cifrada do disco."""
         try:
             if not filename.endswith(".wallet"):
                 filename += ".wallet"
             path = os.path.join(WalletManager.WALLETS_DIR, filename)
-
             with open(path) as f:
                 blob = f.read()
-
             w = Wallet.import_encrypted(blob, password)
             return {
                 "ok": True,
@@ -177,7 +161,6 @@ class WalletManager:
 
     @staticmethod
     def list_wallets() -> list:
-        """Lista carteiras salvas (sem revelar chaves)."""
         try:
             WalletManager._garantir_dir()
             out = []
@@ -196,20 +179,102 @@ class WalletManager:
 
 
 # ============================================================
-# ✅ NOVO: assinatura de transações BRN (usado por server.py)
+# HD WALLET (BIP39 + BIP44) — restaurado
+# ============================================================
+class HDWalletManager:
+    """
+    Carteira HD (BIP39 + BIP44) compatível com server.py e app_wallet_v3.py.
+    """
+    PURPOSE = 44
+    COIN_TYPE = 0
+    ACCOUNT = 0
+    CHANGE = 0
+
+    @staticmethod
+    def _m():
+        try:
+            from mnemonic import Mnemonic
+            return Mnemonic("english")
+        except ImportError:
+            raise ImportError("Instale: python -m pip install mnemonic")
+
+    @staticmethod
+    def create(strength=128):
+        m = HDWalletManager._m()
+        mnemonic_phrase = m.generate(strength=strength)
+        return HDWalletManager.from_mnemonic(mnemonic_phrase, index=0)
+
+    @staticmethod
+    def from_mnemonic(mnemonic_phrase, index=0, passphrase=""):
+        m = HDWalletManager._m()
+        if not m.check(mnemonic_phrase):
+            raise ValueError("Mnemônico inválido")
+
+        seed = m.to_seed(mnemonic_phrase, passphrase=passphrase)
+        I = hmac_lib.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+        master_key = int.from_bytes(I[:32], "big")
+        master_chain = I[32:]
+
+        path = [
+            HDWalletManager.PURPOSE + 0x80000000,
+            HDWalletManager.COIN_TYPE + 0x80000000,
+            HDWalletManager.ACCOUNT + 0x80000000,
+            HDWalletManager.CHANGE,
+            index,
+        ]
+
+        key = master_key
+        chain = master_chain
+        for child in path:
+            if child >= 0x80000000:
+                data = b"\x00" + key.to_bytes(32, "big") + child.to_bytes(4, "big")
+            else:
+                pub = pubkey_from_priv(key.to_bytes(32, "big"))
+                data = pub + child.to_bytes(4, "big")
+            I = hmac_lib.new(chain, data, hashlib.sha512).digest()
+            key = (int.from_bytes(I[:32], "big") + key) % (
+                0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+            )
+            chain = I[32:]
+
+        w = Wallet(private_key_hex=key.to_bytes(32, "big").hex())
+        return {
+            "mnemonic": mnemonic_phrase,
+            "address": w.address,
+            "private_key": w.priv_hex,
+            "public_key": w.pub_hex,
+            "index": index,
+            "path": f"m/44'/{HDWalletManager.COIN_TYPE}'/0'/0/{index}",
+        }
+
+    @staticmethod
+    def derive_many(mnemonic_phrase, count=5):
+        if count < 1 or count > 100:
+            raise ValueError("count deve estar entre 1 e 100")
+        return [
+            HDWalletManager.from_mnemonic(mnemonic_phrase, index=i)
+            for i in range(count)
+        ]
+
+    @staticmethod
+    def validate_mnemonic(mnemonic_phrase):
+        try:
+            m = HDWalletManager._m()
+            return m.check(mnemonic_phrase)
+        except Exception:
+            return False
+
+
+# ============================================================
+# HELPERS
 # ============================================================
 def sign_transaction(wallet: Wallet, tx_core: dict) -> str:
-    """
-    Assina o hash de uma transação BRN.
-    Usa signing_hash de blockchain.py para garantir compatibilidade.
-    """
     from blockchain import signing_hash
     h = signing_hash(tx_core)
     return wallet.sign(h)
 
 
 def verify_transaction(tx: dict) -> tuple[bool, str]:
-    """Verifica assinaturas de todos os inputs de uma tx."""
     try:
         from blockchain import signing_hash
         h = signing_hash(tx)
