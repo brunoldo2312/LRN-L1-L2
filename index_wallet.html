@@ -5,197 +5,375 @@
 <title>BRN Wallet</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-         background: #0d1117; color: #e6edf3; padding: 16px; font-size: 14px;
-         line-height: 1.5; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; padding: 16px; font-size: 14px;
+    line-height: 1.5;
+  }
   .wrap { max-width: 980px; margin: 0 auto; }
-  header { display: flex; justify-content: space-between; align-items: center;
-           padding-bottom: 12px; border-bottom: 1px solid #30363d; margin-bottom: 14px; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding-bottom: 12px; border-bottom: 1px solid #30363d; margin-bottom: 14px;
+    flex-wrap: wrap; gap: 12px;
+  }
   h1 { font-size: 1.25rem; }
   h1 span { color: #58a6ff; }
+
+  .topbar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    font-size: .82rem;
+  }
+  .topbar-item { display: flex; align-items: center; gap: 6px; }
+  .topbar-label { color: #8b949e; }
+  .topbar-strong { font-weight: 600; }
+
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%;
-         background:#8b949e; margin-right:6px; }
-  .dot.on { background:#3fb950; }
+         background:#8b949e; transition: background .3s; }
+  .dot.on  { background:#3fb950; animation: pulse 2s infinite; }
   .dot.off { background:#f85149; }
-  .tabs { display:flex; gap:4px; margin-bottom:14px; border-bottom:1px solid #30363d; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  .sync-bar {
+    width: 110px; height: 8px; background: #21262d; border-radius: 4px;
+    overflow: hidden;
+  }
+  .sync-bar > div {
+    height: 100%; width: 100%; background: #3fb950;
+    transition: width .4s, background .4s;
+  }
+
+  .tabs { display:flex; gap:4px; margin-bottom:14px;
+          border-bottom:1px solid #30363d; }
   .tab { background:transparent; border:none; color:#8b949e; padding:8px 14px;
          cursor:pointer; font-family:inherit; font-size:.9rem;
          border-bottom:2px solid transparent; }
   .tab:hover { color:#e6edf3; }
   .tab.active { color:#58a6ff; border-bottom-color:#58a6ff; }
+
   .panel { display:none; }
   .panel.active { display:block; }
+
   .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
           padding:16px; margin-bottom:12px; }
   .card h2 { font-size:.82rem; color:#8b949e; text-transform:uppercase;
              letter-spacing:.05em; margin-bottom:10px; }
+
   .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
   .stat { background:#0d1117; border:1px solid #21262d; border-radius:6px;
           padding:10px 12px; }
   .stat .lbl { font-size:.7rem; color:#8b949e; text-transform:uppercase; }
   .stat .val { font-size:1.15rem; font-weight:600; color:#58a6ff; margin-top:2px;
                word-break:break-all; }
+
   label { display:block; font-size:.8rem; color:#8b949e; margin:8px 0 4px; }
-  input, select { width:100%; background:#0d1117; border:1px solid #30363d;
-                  border-radius:6px; color:#e6edf3; padding:8px 10px;
-                  font-family:inherit; font-size:.88rem; }
-  input:focus { outline:none; border-color:#58a6ff; }
+  input, select {
+    width:100%; background:#0d1117; border:1px solid #30363d; border-radius:6px;
+    color:#e6edf3; padding:8px 10px; font-family:inherit; font-size:.88rem;
+  }
+  input:focus, select:focus { outline:none; border-color:#58a6ff; }
+
   .row { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+
   .btn { background:#21262d; color:#e6edf3; border:1px solid #30363d;
-         padding:8px 14px; border-radius:6px; cursor:pointer;
-         font-family:inherit; font-size:.85rem; }
+         padding:8px 14px; border-radius:6px; cursor:pointer; font-family:inherit;
+         font-size:.85rem; }
   .btn:hover { background:#30363d; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
   .btn.p { background:#238636; border-color:#2ea043; color:#fff; }
   .btn.p:hover { background:#2ea043; }
+  .btn.danger { background:#8b2424; border-color:#a52a2a; color:#fff; }
+  .btn.danger:hover { background:#a52a2a; }
+
   .addr { display:block; padding:8px 10px; margin-top:6px;
           background:#0d1117; border:1px solid #21262d; border-radius:6px;
           font-family:ui-monospace,Menlo,monospace; font-size:.78rem;
           color:#79c0ff; word-break:break-all; }
+
   .msg { margin-top:10px; padding:9px 11px; border-radius:6px;
          font-size:.83rem; display:none; }
   .msg.show { display:block; }
   .msg.ok   { background:#0d2818; border:1px solid #238636; color:#7ee787; }
   .msg.err  { background:#2d1416; border:1px solid #8b2424; color:#ffa198; }
+  .msg.info { background:#0d1d2f; border:1px solid #1f6feb; color:#79c0ff; }
+
   table { width:100%; border-collapse:collapse; font-size:.82rem; }
   th, td { padding:7px 8px; text-align:left; border-bottom:1px solid #21262d; }
   th { color:#8b949e; font-size:.72rem; text-transform:uppercase; font-weight:500; }
+  tr:hover { background:#1c2128; cursor:pointer; }
   code { font-family:ui-monospace,Menlo,monospace; font-size:.75rem;
          background:#0d1117; padding:2px 5px; border-radius:4px; color:#79c0ff; }
+
   .footer { text-align:center; margin-top:20px; padding-top:12px;
             border-top:1px solid #30363d; color:#8b949e; font-size:.75rem; }
+
+  .spin { display:inline-block; width:11px; height:11px;
+          border:2px solid #30363d; border-top-color:#58a6ff; border-radius:50%;
+          animation:sp .8s linear infinite; margin-right:6px; vertical-align:middle; }
+  @keyframes sp { to { transform:rotate(360deg) } }
+
+  .mining-box {
+    display:none; margin-top:10px; padding:10px;
+    background:#0d2818; border:1px solid #238636; border-radius:6px;
+    font-size:.82rem; color:#7ee787;
+  }
+  .mining-box.show { display:block; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-<header>
-  <h1>🔷 <span>BRN</span> Wallet</h1>
-  <div>
-    <span class="dot" id="dot"></span>
-    <span id="statusTxt" style="font-size:.82rem;color:#8b949e;">Conectando…</span>
-  </div>
-</header>
-
-<div class="tabs">
-  <button class="tab active" data-tab="explorer">🔍 Explorador</button>
-  <button class="tab" data-tab="carteira">💼 Carteira</button>
-  <button class="tab" data-tab="enviar">📤 Enviar</button>
-  <button class="tab" data-tab="arquivo">💾 Arquivo</button>
-</div>
-
-<!-- EXPLORADOR -->
-<div class="panel active" id="p-explorer">
-  <div class="card">
-    <h2>Estado do nó</h2>
-    <div class="grid3">
-      <div class="stat"><div class="lbl">Altura</div><div class="val" id="eHeight">—</div></div>
-      <div class="stat"><div class="lbl">Mempool</div><div class="val" id="eMempool">—</div></div>
-      <div class="stat"><div class="lbl">Dificuldade</div><div class="val" id="eDiff">—</div></div>
-      <div class="stat"><div class="lbl">UTXOs</div><div class="val" id="eUtxos">—</div></div>
-      <div class="stat"><div class="lbl">Recompensa</div><div class="val" id="eReward">—</div></div>
-      <div class="stat"><div class="lbl">Peers</div><div class="val" id="ePeers">—</div></div>
+  <header>
+    <h1>🔷 <span>BRN</span> Wallet</h1>
+    <div class="topbar">
+      <div class="topbar-item">
+        <span class="dot" id="dot"></span>
+        <span id="statusTxt">Conectando…</span>
+      </div>
+      <div class="topbar-item">
+        <span class="topbar-label">Sync:</span>
+        <div class="sync-bar"><div id="syncBar"></div></div>
+        <span class="topbar-strong" id="syncPct" style="color:#3fb950;">100%</span>
+      </div>
+      <div class="topbar-item">
+        <span class="topbar-label">Peers:</span>
+        <span class="topbar-strong" id="peerCount">0</span>
+      </div>
+      <div class="topbar-item" title="BTC → BRN (onramp)">
+        <span class="topbar-label">BTC→BRN</span>
+        <span id="brOnramp">⚪</span>
+      </div>
+      <div class="topbar-item" title="BRN → BTC (offramp)">
+        <span class="topbar-label">BRN→BTC</span>
+        <span id="brOfframp">⚪</span>
+      </div>
     </div>
-    <div class="row"><button class="btn p" id="bRefreshExp">🔄 Atualizar</button></div>
-    <div class="msg" id="mExp"></div>
-  </div>
-  <div class="card">
-    <h2>Últimos blocos</h2>
-    <table>
-      <thead><tr><th>#</th><th>Hash</th><th>Timestamp</th><th>Txs</th><th>Dif.</th></tr></thead>
-      <tbody id="tbodyBlocks"><tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr></tbody>
-    </table>
-  </div>
-</div>
+  </header>
 
-<!-- CARTEIRA -->
-<div class="panel" id="p-carteira">
-  <div class="card">
-    <h2>Minha carteira</h2>
-    <div class="row">
-      <button class="btn p" id="bGerar">🎲 Gerar nova</button>
-      <button class="btn" id="bAtualizar">🔄 Atualizar saldo</button>
-    </div>
-    <div id="walletBox" style="display:none;">
-      <label>Endereço</label>
-      <span class="addr" id="wAddr">—</span>
-      <label>Saldo</label>
-      <div class="stat" style="margin-top:4px;"><div class="val" id="wSaldo">— BRN</div></div>
-      <label>Chave privada (clique para revelar)</label>
-      <span class="addr" id="wPriv" style="cursor:pointer;filter:blur(4px);">—</span>
-      <label>Chave pública</label>
-      <span class="addr" id="wPub">—</span>
-    </div>
-    <div class="msg" id="mCart"></div>
+  <div class="tabs">
+    <button class="tab active" data-tab="explorer">🔍 Explorador</button>
+    <button class="tab" data-tab="carteira">💼 Carteira</button>
+    <button class="tab" data-tab="enviar">📤 Enviar</button>
+    <button class="tab" data-tab="bridge">🌉 Bridge</button>
+    <button class="tab" data-tab="arquivo">💾 Arquivo</button>
   </div>
-  <div class="card">
-    <h2>Minhas transações</h2>
-    <table>
-      <thead><tr><th>TXID</th><th>Altura</th><th>Outputs</th></tr></thead>
-      <tbody id="tbodyMyTxs"><tr><td colspan="3" style="color:#8b949e;">—</td></tr></tbody>
-    </table>
-    <div class="row"><button class="btn" id="bMyTxs">🔄 Carregar</button></div>
-  </div>
-</div>
 
-<!-- ENVIAR -->
-<div class="panel" id="p-enviar">
-  <div class="card">
-    <h2>Enviar BRN</h2>
-    <label>De</label>
-    <input id="txFrom" readonly placeholder="brn1...">
-    <label>Para</label>
-    <input id="txTo" placeholder="brn1...">
-    <label>Valor (BRN)</label>
-    <input id="txAmount" type="number" step="0.00001" min="0.00001" placeholder="1.5">
-    <div class="row"><button class="btn p" id="bEnviar">📤 Enviar</button></div>
-    <div class="msg" id="mEnviar"></div>
-  </div>
-  <div class="card">
-    <h2>Mineração</h2>
-    <div class="row">
-      <button class="btn p" id="bMinerar">⛏️ Minerar bloco</button>
-      <button class="btn" id="bFaucet">🚰 Faucet</button>
+  <!-- ============ EXPLORADOR ============ -->
+  <div class="panel active" id="p-explorer">
+    <div class="card">
+      <h2>Estado do nó</h2>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">Altura</div><div class="val" id="eHeight">—</div></div>
+        <div class="stat"><div class="lbl">Mempool</div><div class="val" id="eMempool">—</div></div>
+        <div class="stat"><div class="lbl">Dificuldade</div><div class="val" id="eDiff">—</div></div>
+        <div class="stat"><div class="lbl">UTXOs</div><div class="val" id="eUtxos">—</div></div>
+        <div class="stat"><div class="lbl">Recompensa</div><div class="val" id="eReward">—</div></div>
+        <div class="stat"><div class="lbl">Peers</div><div class="val" id="ePeers">—</div></div>
+      </div>
+      <div class="row">
+        <button class="btn p" id="bRefreshExp">🔄 Atualizar</button>
+      </div>
+      <div class="msg" id="mExp"></div>
     </div>
-    <div class="msg" id="mMine"></div>
-  </div>
-</div>
 
-<!-- ARQUIVO -->
-<div class="panel" id="p-arquivo">
-  <div class="card">
-    <h2>Salvar carteira criptografada</h2>
-    <label>Nome do arquivo</label>
-    <input id="svName" placeholder="minha_carteira">
-    <label>Senha</label>
-    <input id="svPass" type="password" placeholder="••••••••">
-    <div class="row"><button class="btn p" id="bSalvar">💾 Salvar</button></div>
-    <div class="msg" id="mSalvar"></div>
-  </div>
-  <div class="card">
-    <h2>Carregar carteira</h2>
-    <label>Arquivos salvos</label>
-    <select id="ldList"><option value="">— carregando —</option></select>
-    <label>Ou digite o nome</label>
-    <input id="ldName" placeholder="minha_carteira">
-    <label>Senha</label>
-    <input id="ldPass" type="password" placeholder="••••••••">
-    <div class="row">
-      <button class="btn" id="bListar">🔄 Listar</button>
-      <button class="btn p" id="bCarregar">📂 Carregar</button>
+    <div class="card">
+      <h2>Últimos blocos (clique para detalhar)</h2>
+      <table>
+        <thead>
+          <tr><th>#</th><th>Hash</th><th>Timestamp</th><th>Txs</th><th>Dif.</th></tr>
+        </thead>
+        <tbody id="tbodyBlocks">
+          <tr><td colspan="5" style="color:#8b949e;font-style:italic;">Carregando…</td></tr>
+        </tbody>
+      </table>
     </div>
-    <div class="msg" id="mCarregar"></div>
-  </div>
-</div>
 
-<div class="footer">BRN Wallet v3.2 · ponte pywebview</div>
+    <div class="card" id="cardDetail" style="display:none;">
+      <h2>Detalhes do bloco <span id="dHeight" style="color:#58a6ff;">#</span></h2>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">Hash</div><div class="val" id="dHash" style="font-size:.75rem;"></div></div>
+        <div class="stat"><div class="lbl">Prev hash</div><div class="val" id="dPrev" style="font-size:.75rem;"></div></div>
+        <div class="stat"><div class="lbl">Merkle</div><div class="val" id="dMerkle" style="font-size:.75rem;"></div></div>
+        <div class="stat"><div class="lbl">Nonce</div><div class="val" id="dNonce">—</div></div>
+        <div class="stat"><div class="lbl">Dificuldade</div><div class="val" id="dDiff">—</div></div>
+        <div class="stat"><div class="lbl">Txs</div><div class="val" id="dTxs">—</div></div>
+      </div>
+      <h2 style="margin-top:14px;">Transações</h2>
+      <table>
+        <thead><tr><th>TXID</th><th>Outputs</th></tr></thead>
+        <tbody id="tbodyTxs"><tr><td colspan="2" style="color:#8b949e;">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ CARTEIRA ============ -->
+  <div class="panel" id="p-carteira">
+    <div class="card">
+      <h2>Minha carteira</h2>
+      <div class="row">
+        <button class="btn p" id="bGerar">🎲 Gerar nova</button>
+        <button class="btn" id="bAtualizar">🔄 Atualizar saldo</button>
+      </div>
+
+      <div id="walletBox" style="display:none;">
+        <label>Endereço</label>
+        <span class="addr" id="wAddr">—</span>
+
+        <label>Saldo</label>
+        <div class="stat" style="margin-top:4px;">
+          <div class="val" id="wSaldo">— BRN</div>
+        </div>
+
+        <label>Chave privada (clique para revelar)</label>
+        <span class="addr" id="wPriv" style="cursor:pointer;filter:blur(4px);">—</span>
+
+        <label>Chave pública</label>
+        <span class="addr" id="wPub">—</span>
+
+        <div class="stat" style="margin-top:12px;border-color:#238636;">
+          <div class="lbl">⛏️ Minerando para</div>
+          <div class="val" id="minerTarget" style="font-size:.78rem;color:#7ee787;">—</div>
+        </div>
+      </div>
+
+      <div class="msg" id="mCart"></div>
+    </div>
+
+    <div class="card">
+      <h2>Minhas transações</h2>
+      <table>
+        <thead><tr><th>TXID</th><th>Altura</th><th>Outputs</th></tr></thead>
+        <tbody id="tbodyMyTxs"><tr><td colspan="3" style="color:#8b949e;">—</td></tr></tbody>
+      </table>
+      <div class="row"><button class="btn" id="bMyTxs">🔄 Carregar</button></div>
+    </div>
+  </div>
+
+  <!-- ============ ENVIAR ============ -->
+  <div class="panel" id="p-enviar">
+    <div class="card">
+      <h2>Enviar BRN</h2>
+      <label>De</label>
+      <input id="txFrom" readonly placeholder="brn1...">
+      <label>Para</label>
+      <input id="txTo" placeholder="brn1...">
+      <label>Valor (BRN)</label>
+      <input id="txAmount" type="number" step="0.00001" min="0.00001" placeholder="1.5">
+      <div class="row">
+        <button class="btn p" id="bEnviar">📤 Enviar</button>
+      </div>
+      <div class="msg" id="mEnviar"></div>
+    </div>
+
+    <div class="card">
+      <h2>Mineração</h2>
+      <div class="row">
+        <button class="btn p" id="bMinerar">⛏️ Iniciar mineração</button>
+        <button class="btn" id="bFaucet">🚰 Faucet</button>
+      </div>
+
+      <div class="mining-box" id="miningInfo">
+        <div>⛏️ <b>Minerando</b> para <code id="miningAddr" style="font-size:.72rem;"></code></div>
+        <div style="margin-top:4px;">
+          Blocos minerados: <b id="miningCount">0</b> ·
+          Último: <b id="miningLast">—</b> ·
+          Tempo: <b id="miningUptime">0s</b>
+        </div>
+      </div>
+      <div class="msg" id="mMine"></div>
+    </div>
+  </div>
+
+  <!-- ============ BRIDGE ============ -->
+  <div class="panel" id="p-bridge">
+    <div class="card">
+      <h2>Status da bridge BTC ↔ BRN</h2>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">Onramp (BTC→BRN)</div><div class="val" id="brOnState">—</div></div>
+        <div class="stat"><div class="lbl">Offramp (BRN→BTC)</div><div class="val" id="brOffState">—</div></div>
+        <div class="stat"><div class="lbl">Taxa</div><div class="val" id="brRate">—</div></div>
+        <div class="stat"><div class="lbl">Cofre BTC</div><div class="val" id="brCofreBtc" style="font-size:.75rem;">—</div></div>
+        <div class="stat"><div class="lbl">Processados</div><div class="val" id="brProc">—</div></div>
+        <div class="stat"><div class="lbl">Última sync</div><div class="val" id="brSync" style="font-size:.8rem;">—</div></div>
+      </div>
+      <div class="row">
+        <button class="btn p" id="bBridgeRefresh">🔄 Atualizar</button>
+      </div>
+      <div class="msg" id="mBridge"></div>
+    </div>
+
+    <div class="card">
+      <h2>Converter BTC → BRN</h2>
+      <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
+        Envie BTC para o cofre, cole o TXID e clique em Converter.
+      </p>
+      <label>TXID BTC recebido</label>
+      <input id="brTxid" placeholder="ex: 3f4a…">
+      <label>Meu endereço BRN (destino)</label>
+      <input id="brToBrn" readonly placeholder="brn1...">
+      <div class="row">
+        <button class="btn p" id="bBridgeClaim">💱 Converter para BRN</button>
+      </div>
+      <div class="msg" id="mBridgeClaim"></div>
+    </div>
+
+    <div class="card">
+      <h2>Histórico de conversões (BTC→BRN)</h2>
+      <table>
+        <thead><tr><th>TXID BTC</th><th>BRN recebido</th><th>Bloco BRN</th><th>Status</th></tr></thead>
+        <tbody id="tbodyBridge">
+          <tr><td colspan="4" style="color:#8b949e;">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ ARQUIVO ============ -->
+  <div class="panel" id="p-arquivo">
+    <div class="card">
+      <h2>Salvar carteira criptografada</h2>
+      <label>Nome do arquivo</label>
+      <input id="svName" placeholder="minha_carteira">
+      <label>Senha</label>
+      <input id="svPass" type="password" placeholder="••••••••">
+      <div class="row"><button class="btn p" id="bSalvar">💾 Salvar</button></div>
+      <div class="msg" id="mSalvar"></div>
+    </div>
+
+    <div class="card">
+      <h2>Carregar carteira</h2>
+      <label>Arquivos salvos</label>
+      <select id="ldList"><option value="">— carregando —</option></select>
+      <label>Ou digite o nome</label>
+      <input id="ldName" placeholder="minha_carteira">
+      <label>Senha</label>
+      <input id="ldPass" type="password" placeholder="••••••••">
+      <div class="row">
+        <button class="btn" id="bListar">🔄 Listar</button>
+        <button class="btn p" id="bCarregar">📂 Carregar</button>
+      </div>
+      <div class="msg" id="mCarregar"></div>
+    </div>
+  </div>
+
+  <div class="footer">BRN Wallet v3.5 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
 "use strict";
+
+// ============================================================
+// ESTADO
+// ============================================================
 let wallet = { address:"", private_key:"", public_key:"" };
 let ready = false;
+let miningRunning = false;
 
+// ============================================================
+// HELPERS
+// ============================================================
 const $ = id => document.getElementById(id);
+
 function msg(id, text, type = "info", autoHideMs = 0) {
   const el = $(id);
   el.textContent = text;
@@ -203,22 +381,37 @@ function msg(id, text, type = "info", autoHideMs = 0) {
   if (autoHideMs) setTimeout(() => { el.className = "msg"; }, autoHideMs);
 }
 function clearMsg(id) { $(id).className = "msg"; }
-function fmtBRN(v) { return (Number(v) || 0).toFixed(8).replace(/\.?0+$/, "") + " BRN"; }
-function shortHash(h, n = 14) { return (h || "").slice(0, n) + "…"; }
 
 async function api(method, ...args) {
-  if (!ready) throw new Error("Ponte pywebview ainda nao pronta");
+  if (!ready) throw new Error("Ponte pywebview ainda não pronta");
   const fn = window.pywebview && window.pywebview.api && window.pywebview.api[method];
-  if (typeof fn !== "function") throw new Error("Metodo nao exposto: " + method);
+  if (typeof fn !== "function") throw new Error("Método não exposto: " + method);
   return await fn(...args);
 }
 
+function fmtBRN(v) {
+  const n = Number(v) || 0;
+  return n.toFixed(8).replace(/\.?0+$/, "") + " BRN";
+}
+function shortHash(h, n = 14) { return (h || "").slice(0, n) + "…"; }
+function fmtUptime(sec) {
+  sec = Number(sec) || 0;
+  if (sec < 60)   return sec + "s";
+  if (sec < 3600) return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h + "h " + m + "m";
+}
+
+// ============================================================
+// STATUS DO NÓ
+// ============================================================
 async function refreshStatus() {
   try {
     const s = await api("node_status");
     if (!s.ok) throw new Error(s.msg || "offline");
     $("dot").className = "dot on";
-    $("statusTxt").textContent = "No online";
+    $("statusTxt").textContent = "Nó online";
     $("eHeight").textContent  = s.height != null ? s.height : "—";
     $("eMempool").textContent = s.mempool != null ? s.mempool : "—";
     $("eDiff").textContent    = s.difficulty != null ? s.difficulty : "—";
@@ -227,10 +420,56 @@ async function refreshStatus() {
     $("eReward").textContent  = s.reward ? fmtBRN(s.reward / 1e8) : "—";
   } catch (e) {
     $("dot").className = "dot off";
-    $("statusTxt").textContent = "No offline";
+    $("statusTxt").textContent = "Nó offline";
   }
 }
 
+// ============================================================
+// SYNC INFO
+// ============================================================
+async function refreshSyncInfo() {
+  try {
+    const d = await api("sync_info");
+    if (d.erro) throw new Error(d.erro);
+
+    const pct = Number(d.sync && d.sync.percent != null ? d.sync.percent : 100);
+    $("syncBar").style.width = pct + "%";
+    $("syncPct").textContent = pct.toFixed(2) + "%";
+    let cor = "#3fb950";
+    if (pct < 99)  cor = "#d29922";
+    if (pct < 50)  cor = "#f85149";
+    $("syncBar").style.background = cor;
+    $("syncPct").style.color = cor;
+
+    $("peerCount").textContent = (d.sync && d.sync.peers) || 0;
+
+    const onramp  = d.bridge && d.bridge.onramp_ativo;
+    const offramp = d.bridge && d.bridge.offramp_ativo;
+    $("brOnramp").textContent  = onramp  ? "🟢" : "🔴";
+    $("brOfframp").textContent = offramp ? "🟢" : "🔴";
+
+    if (d.miner_target) {
+      const el = $("minerTarget");
+      if (el) el.textContent = d.miner_target;
+    }
+
+    if ($("brOnState")) {
+      $("brOnState").textContent  = onramp  ? "🟢 Ativo"  : "🔴 Inativo";
+      $("brOffState").textContent = offramp ? "🟢 Ativo"  : "🔴 Falta WIF";
+      $("brRate").textContent     = ((d.bridge && d.bridge.taxa) || 0).toLocaleString("pt-BR");
+      $("brCofreBtc").textContent = d.bridge && d.bridge.btc_cofre
+        ? d.bridge.btc_cofre.slice(0,20) + "…" : "—";
+      $("brProc").textContent     = (d.bridge_onramp && d.bridge_onramp.processados) || 0;
+      $("brSync").textContent     = (d.bridge_onramp && d.bridge_onramp.ultima_sync) || "—";
+    }
+  } catch (e) {
+    // silencioso
+  }
+}
+
+// ============================================================
+// EXPLORADOR
+// ============================================================
 async function carregarBlocos() {
   const tb = $("tbodyBlocks");
   tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
@@ -249,8 +488,10 @@ async function carregarBlocos() {
       const txs = Array.isArray(b.transactions) ? b.transactions.length : (b.txs || 0);
       tr.innerHTML = '<td><b>' + b.height + '</b></td>' +
                      '<td><code>' + shortHash(b.hash, 16) + '</code></td>' +
-                     '<td>' + ts + '</td><td>' + txs + '</td>' +
+                     '<td>' + ts + '</td>' +
+                     '<td>' + txs + '</td>' +
                      '<td>' + (b.difficulty != null ? b.difficulty : "—") + '</td>';
+      tr.onclick = function() { detalharBloco(b.height); };
       tb.appendChild(tr);
     }
     clearMsg("mExp");
@@ -259,6 +500,38 @@ async function carregarBlocos() {
   }
 }
 
+async function detalharBloco(height) {
+  try {
+    const r = await api("get_block", height);
+    if (r.erro || !r.block) throw new Error(r.erro || "bloco não encontrado");
+    const b = r.block;
+    $("cardDetail").style.display = "block";
+    $("dHeight").textContent = "#" + b.height;
+    $("dHash").textContent   = b.hash;
+    $("dPrev").textContent   = b.prev_hash;
+    $("dMerkle").textContent = b.merkle;
+    $("dNonce").textContent  = b.nonce;
+    $("dDiff").textContent   = b.difficulty;
+    $("dTxs").textContent    = (b.transactions || []).length;
+    const tb = $("tbodyTxs");
+    tb.innerHTML = "";
+    for (const t of (b.transactions || [])) {
+      const tr = document.createElement("tr");
+      const outStr = (t.outputs || []).map(function(o) {
+        return ((o.address || "").slice(0,12)) + "… +" + ((o.amount / 1e8).toFixed(4));
+      }).join("<br>");
+      tr.innerHTML = '<td><code>' + shortHash(t.txid, 20) + '</code></td>' +
+                     '<td>' + (outStr || "—") + '</td>';
+      tb.appendChild(tr);
+    }
+  } catch (e) {
+    msg("mExp", "❌ " + e.message, "err");
+  }
+}
+
+// ============================================================
+// CARTEIRA
+// ============================================================
 async function gerarCarteira() {
   clearMsg("mCart");
   try {
@@ -266,9 +539,11 @@ async function gerarCarteira() {
     if (w.erro || !w.address) throw new Error(w.erro || "falha ao gerar");
     wallet = { address: w.address, private_key: w.private_key, public_key: w.public_key };
     renderCarteira();
-    msg("mCart", "✅ Carteira criada. Guarde a chave privada!", "ok", 5000);
+    msg("mCart", "✅ Carteira criada. Minerador aponta para ela.", "ok", 5000);
     await atualizarSaldo();
     await carregarMinhasTxs();
+    await refreshSyncInfo();
+    await updateMiningUI();
   } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
 }
 
@@ -280,6 +555,7 @@ function renderCarteira() {
   $("wPriv").style.filter = "blur(4px)";
   $("wPub").textContent  = wallet.public_key;
   $("txFrom").value = wallet.address;
+  $("brToBrn").value = wallet.address;
 }
 
 async function atualizarSaldo() {
@@ -300,7 +576,7 @@ async function carregarMinhasTxs() {
     if (r.erro) throw new Error(r.erro);
     const txs = (r.transactions || []).slice().reverse();
     if (!txs.length) {
-      tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Sem transacoes</td></tr>';
+      tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Sem transações</td></tr>';
       return;
     }
     tb.innerHTML = "";
@@ -319,49 +595,116 @@ async function carregarMinhasTxs() {
   }
 }
 
+// ============================================================
+// ENVIO
+// ============================================================
 async function enviar() {
   clearMsg("mEnviar");
-  if (!wallet.address) { msg("mEnviar", "❌ Gere uma carteira primeiro.", "err"); return; }
+  if (!wallet.address) { msg("mEnviar", "❌ Gere/carregue uma carteira.", "err"); return; }
   const to = $("txTo").value.trim();
   const amt = parseFloat($("txAmount").value);
-  if (!to) { msg("mEnviar", "❌ Informe o destinatario.", "err"); return; }
-  if (!(amt > 0)) { msg("mEnviar", "❌ Valor invalido.", "err"); return; }
+  if (!to)        { msg("mEnviar", "❌ Informe o destinatário.", "err"); return; }
+  if (!(amt > 0)) { msg("mEnviar", "❌ Valor inválido.", "err"); return; }
+
+  const btn = $("bEnviar");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Enviando…';
   try {
-    const r = await api("transfer", wallet.address, to, "BRN", amt,
-                        wallet.private_key, wallet.public_key);
+    const r = await api("transfer",
+      wallet.address, to, "BRN", amt,
+      wallet.private_key, wallet.public_key);
     if (r.ok) {
-      msg("mEnviar", "✅ Aceita. TXID: " + shortHash(r.txid, 20), "ok", 6000);
+      msg("mEnviar", "✅ Aceita na mempool. TXID: " + shortHash(r.txid, 20), "ok", 6000);
       $("txTo").value = ""; $("txAmount").value = "";
       await atualizarSaldo();
+      await carregarMinhasTxs();
     } else {
       msg("mEnviar", "❌ " + (r.msg || "falha"), "err");
     }
-  } catch (e) { msg("mEnviar", "❌ " + e.message, "err"); }
+  } catch (e) {
+    msg("mEnviar", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false; btn.textContent = "📤 Enviar";
+  }
 }
 
+// ============================================================
+// MINERAÇÃO TOGGLE (iniciar / parar)
+// ============================================================
 async function minerar() {
   clearMsg("mMine");
-  if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
-  try {
-    const r = await api("mine_block", wallet.address);
-    if (r.ok) {
-      msg("mMine", "✅ Bloco minerado!", "ok", 5000);
-      await atualizarSaldo();
-      await refreshStatus();
-      await carregarBlocos();
-    } else {
-      msg("mMine", "❌ " + (r.msg || "falha"), "err");
+  if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
+
+  const btn = $("bMinerar");
+  btn.disabled = true;
+
+  if (miningRunning) {
+    // ============ PARAR ============
+    btn.innerHTML = '<span class="spin"></span>Parando…';
+    try {
+      const r = await api("stop_mining");
+      const count = r && r.count != null ? r.count : 0;
+      msg("mMine", "⏹️ Mineração parada (" + count + " blocos minerados).", "ok", 6000);
+      miningRunning = false;
+    } catch (e) {
+      msg("mMine", "❌ " + e.message, "err");
+    } finally {
+      await updateMiningUI();
     }
-  } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
+  } else {
+    // ============ INICIAR ============
+    btn.innerHTML = '<span class="spin"></span>Iniciando…';
+    try {
+      const r = await api("start_mining", wallet.address);
+      if (r && r.ok) {
+        msg("mMine", "⛏️ Mineração iniciada. Clique de novo para parar.", "ok", 6000);
+        miningRunning = true;
+      } else {
+        msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
+      }
+    } catch (e) {
+      msg("mMine", "❌ " + e.message, "err");
+    } finally {
+      await updateMiningUI();
+    }
+  }
+}
+
+async function updateMiningUI() {
+  try {
+    const st = await api("mining_status");
+    const btn = $("bMinerar");
+    const box = $("miningInfo");
+
+    miningRunning = !!(st && st.running);
+    btn.disabled = false;
+
+    if (miningRunning) {
+      btn.className = "btn danger";
+      btn.textContent = "⏹️ Parar mineração";
+      box.classList.add("show");
+      $("miningAddr").textContent  = st.address || "—";
+      $("miningCount").textContent = st.count || 0;
+      $("miningLast").textContent  = st.last_height != null ? "#" + st.last_height : "—";
+      $("miningUptime").textContent = fmtUptime(st.uptime || 0);
+    } else {
+      btn.className = "btn p";
+      btn.textContent = "⛏️ Iniciar mineração";
+      box.classList.remove("show");
+    }
+  } catch (e) {
+    // silencioso
+  }
 }
 
 async function faucet() {
   clearMsg("mMine");
   if (!wallet.address) { msg("mMine", "❌ Sem carteira.", "err"); return; }
   try {
-    const r = await api("call_faucet", wallet.address, wallet.private_key, wallet.public_key);
+    const r = await api("call_faucet",
+      wallet.address, wallet.private_key, wallet.public_key);
     if (r.ok) {
-      msg("mMine", "✅ " + (r.msg || "Faucet recebido!"), "ok", 5000);
+      msg("mMine", "✅ " + (r.msg || "Faucet recebido!"), "ok", 6000);
       await atualizarSaldo();
     } else {
       msg("mMine", "❌ " + (r.msg || "falha"), "err");
@@ -369,6 +712,46 @@ async function faucet() {
   } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
 }
 
+// ============================================================
+// BRIDGE
+// ============================================================
+async function bridgeRefresh() {
+  clearMsg("mBridge");
+  await refreshSyncInfo();
+}
+
+async function bridgeClaim() {
+  clearMsg("mBridgeClaim");
+  const txid = $("brTxid").value.trim();
+  if (!txid)           { msg("mBridgeClaim", "❌ Informe o TXID.", "err"); return; }
+  if (!wallet.address) { msg("mBridgeClaim", "❌ Gere uma carteira primeiro.", "err"); return; }
+
+  const btn = $("bBridgeClaim");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Convertendo…';
+  try {
+    const r = await api("bridge_claim", txid, wallet.address);
+    if (r.ok) {
+      msg("mBridgeClaim",
+          "✅ +" + fmtBRN(r.brn_recebido) + " (bloco #" + r.bloco + ")",
+          "ok", 8000);
+      $("brTxid").value = "";
+      await atualizarSaldo();
+      await refreshSyncInfo();
+    } else {
+      msg("mBridgeClaim", "❌ " + (r.msg || "falha"), "err");
+    }
+  } catch (e) {
+    msg("mBridgeClaim", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "💱 Converter para BRN";
+  }
+}
+
+// ============================================================
+// SALVAR / CARREGAR
+// ============================================================
 async function salvar() {
   clearMsg("mSalvar");
   if (!wallet.address) { msg("mSalvar", "❌ Sem carteira.", "err"); return; }
@@ -377,8 +760,8 @@ async function salvar() {
   if (!name) { msg("mSalvar", "❌ Informe o nome.", "err"); return; }
   if (!pass) { msg("mSalvar", "❌ Informe a senha.", "err"); return; }
   try {
-    const r = await api("save_wallet", name, pass,
-                        wallet.address, wallet.private_key, wallet.public_key);
+    const r = await api("save_wallet",
+      name, pass, wallet.address, wallet.private_key, wallet.public_key);
     if (r.ok) {
       msg("mSalvar", "✅ " + (r.msg || "Salvo."), "ok", 5000);
       $("svPass").value = "";
@@ -399,23 +782,25 @@ async function listarWallets() {
       o.value = w.filename; o.textContent = w.filename;
       sel.appendChild(o);
     });
-  } catch (_) {}
+  } catch (e) { /* silent */ }
 }
 
 async function carregar() {
   clearMsg("mCarregar");
   const name = $("ldList").value || $("ldName").value.trim();
   const pass = $("ldPass").value;
-  if (!name) { msg("mCarregar", "❌ Escolha um arquivo.", "err"); return; }
+  if (!name) { msg("mCarregar", "❌ Escolha/digite o arquivo.", "err"); return; }
   if (!pass) { msg("mCarregar", "❌ Informe a senha.", "err"); return; }
   try {
     const r = await api("load_wallet", name, pass);
     if (r.ok) {
       wallet = { address: r.address, private_key: r.private_key, public_key: r.public_key };
       renderCarteira();
-      msg("mCarregar", "✅ Carregada.", "ok", 5000);
+      msg("mCarregar", "✅ Carteira carregada. Minerador aponta para ela.", "ok", 5000);
       await atualizarSaldo();
       await carregarMinhasTxs();
+      await refreshSyncInfo();
+      await updateMiningUI();
       $("ldPass").value = "";
     } else {
       msg("mCarregar", "❌ " + (r.msg || "falha"), "err");
@@ -423,6 +808,9 @@ async function carregar() {
   } catch (e) { msg("mCarregar", "❌ " + e.message, "err"); }
 }
 
+// ============================================================
+// UI
+// ============================================================
 function configTabs() {
   document.querySelectorAll(".tab").forEach(function(t) {
     t.addEventListener("click", function() {
@@ -430,6 +818,10 @@ function configTabs() {
       document.querySelectorAll(".panel").forEach(function(x) { x.classList.remove("active"); });
       t.classList.add("active");
       $("p-" + t.dataset.tab).classList.add("active");
+      if (t.dataset.tab === "bridge") {
+        refreshSyncInfo();
+        $("brToBrn").value = wallet.address || "";
+      }
     });
   });
 }
@@ -442,28 +834,66 @@ function configEventos() {
   $("bEnviar").onclick     = enviar;
   $("bMinerar").onclick    = minerar;
   $("bFaucet").onclick     = faucet;
+  $("bBridgeRefresh").onclick = bridgeRefresh;
+  $("bBridgeClaim").onclick   = bridgeClaim;
   $("bSalvar").onclick     = salvar;
   $("bListar").onclick     = listarWallets;
   $("bCarregar").onclick   = carregar;
+
   $("wPriv").onclick = function() {
     const el = $("wPriv");
     el.style.filter = el.style.filter === "none" ? "blur(4px)" : "none";
   };
+  $("ldList").onchange = function(e) {
+    if (e.target.value) $("ldName").value = "";
+  };
 }
 
+// ============================================================
+// BOOTSTRAP
+// ============================================================
 async function boot() {
   ready = true;
   configTabs();
   configEventos();
+  $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
+
+  // 1) restaura carteira ativa
+  try {
+    const w = await api("get_active_wallet");
+    if (w.ok && w.address) {
+      wallet = {
+        address: w.address,
+        private_key: w.private_key || "",
+        public_key: w.public_key || "",
+      };
+      renderCarteira();
+      await atualizarSaldo();
+      await carregarMinhasTxs();
+    }
+  } catch (e) { /* primeira vez */ }
+
+  // 2) status iniciais
   await refreshStatus();
   await carregarBlocos();
   await listarWallets();
-  setInterval(refreshStatus, 12000);
-  setInterval(carregarBlocos, 15000);
+  await refreshSyncInfo();
+  await updateMiningUI();
+
+  // 3) loops
+  setInterval(refreshStatus,     10000);
+  setInterval(refreshSyncInfo,    6000);
+  setInterval(carregarBlocos,    20000);
+  setInterval(updateMiningUI,     3000);
+  setInterval(function() { if (wallet.address) atualizarSaldo(); }, 20000);
 }
 
 window.addEventListener("pywebviewready", boot);
-if (window.pywebview && window.pywebview.api) boot();
+
+// Fallback
+if (window.pywebview && window.pywebview.api) {
+  boot();
+}
 </script>
 </body>
 </html>
