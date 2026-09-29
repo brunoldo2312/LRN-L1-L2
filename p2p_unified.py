@@ -809,4 +809,318 @@ class PeerDiscovery:
                             try:
                                 ip, port = addr.split(":")
                                 if self.on_peer_found:
-                                    self.on_peer
+                                    self.on_peer_found(ip, int(port))
+                            except Exception:
+                                pass
+
+                peers[meu_addr] = {
+                    "ts": int(time.time()),
+                    "h": self.bc.db.height() if self.bc else 0,
+                    "id": self.node_uuid[:8],
+                }
+                _gh_escrever_peers(peers)
+                self._salvar_peers()
+            except Exception as e:
+                print(f"[GitHub] erro: {e}")
+            time.sleep(GH_INTERVAL)
+
+    # ---------- tracker ----------
+    def _tracker_loop(self):
+        if not TRACKER_URL:
+            return
+        print(f"[Tracker] Loop iniciado: {TRACKER_URL}")
+        public_ip = _get_public_ip()
+        if public_ip:
+            _anunciar_no_tracker(f"{public_ip}:{self.tcp_port}")
+        while self.running:
+            try:
+                for p in _peers_do_tracker():
+                    p = p.strip()
+                    if not p or p.endswith(f":{self.tcp_port}"):
+                        continue
+                    with self.peers_lock:
+                        novo = p not in self.discovered_peers
+                        self.discovered_peers[p] = time.time()
+                    if novo:
+                        print(f"[Tracker] Descoberto: {p}")
+                        try:
+                            ip, port = p.split(":")
+                            if self.on_peer_found:
+                                self.on_peer_found(ip, int(port))
+                        except Exception:
+                            pass
+                if public_ip:
+                    _anunciar_no_tracker(f"{public_ip}:{self.tcp_port}")
+                self._salvar_peers()
+            except Exception as e:
+                print(f"[Tracker] erro: {e}")
+            time.sleep(TRACKER_INTERVAL)
+
+    def _limpar_peers_mortos(self):
+        while self.running:
+            try:
+                time.sleep(PEER_CLEANUP_S)
+                agora = time.time()
+                with self.peers_lock:
+                    for addr, ts in list(self.discovered_peers.items()):
+                        if ts > 0 and (agora - ts) > PEER_TIMEOUT:
+                            del self.discovered_peers[addr]
+                self._salvar_peers()
+            except Exception:
+                pass
+
+    def run(self):
+        if self.running:
+            return
+        self.running = True
+        threads = [
+            threading.Thread(target=self._start_server, daemon=True, name="Disc-UDP"),
+            threading.Thread(target=self._start_client, daemon=True, name="Disc-UDP-Client"),
+            threading.Thread(target=self._limpar_peers_mortos, daemon=True, name="Disc-Cleanup"),
+            threading.Thread(target=self._ping_bootstrap_loop, daemon=True, name="Disc-Bootstrap"),
+        ]
+        if GH_USER and GH_REPO:
+            threads.append(threading.Thread(target=self._github_loop, daemon=True, name="Disc-GitHub"))
+        if TRACKER_URL:
+            threads.append(threading.Thread(target=self._tracker_loop, daemon=True, name="Disc-Tracker"))
+        for t in threads:
+            t.start()
+            self._threads.append(t)
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        try:
+            if self.client_socket:
+                bye = f"BRN_NODE_BYE:{self.tcp_port}:{self.node_uuid}:{TOKEN_ESPERADO}"
+                self.client_socket.sendto(bye.encode("utf-8"),
+                                           (MULTICAST_GROUP, MULTICAST_PORT))
+        except Exception:
+            pass
+        for sock in (self.server_socket, self.client_socket):
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        self._salvar_peers()
+
+    def listar_peers(self):
+        with self.peers_lock:
+            return list(self.discovered_peers.keys())
+
+    def listar_peers_com_altura(self):
+        out = []
+        with self.peers_lock:
+            peers = list(self.discovered_peers.keys())
+        for p in peers[:50]:
+            try:
+                ip, port = p.split(":")
+                resp = P2PClient.get_chain_height(ip, int(port))
+                if resp:
+                    out.append({
+                        "address": p,
+                        "height": resp.get("height", 0),
+                        "work": resp.get("work", 0),
+                    })
+            except Exception:
+                continue
+        return out
+
+
+# ============================================================
+# MANAGER
+# ============================================================
+class P2PManager:
+    def __init__(self, blockchain, tcp_port=TCP_PORT_DEFAULT, enable_upnp=True):
+        self.bc = blockchain
+        self.tcp_port = tcp_port
+        self.node_uuid = _obter_ou_criar_uuid()
+        self.enable_upnp = enable_upnp
+        self.external_ip = None
+        self.upnp = None
+
+        self.server = P2PServer(
+            blockchain, tcp_port,
+            on_new_block=self._on_new_block,
+            on_new_tx=self._on_new_tx,
+            on_peer_bad=self._on_peer_bad,
+            on_peer_good=self._on_peer_good,
+            get_peers_callback=self._get_peers_for_pex,
+        )
+        self.discovery = PeerDiscovery(
+            tcp_port, self.node_uuid,
+            on_peer_found=self._on_peer_found,
+            blockchain=blockchain,
+        )
+        if enable_upnp:
+            threading.Thread(target=self._setup_upnp, daemon=True, name="UPnP").start()
+
+    def start(self):
+        self.server.start()
+        self.discovery.run()
+        print(f"[P2P] Manager iniciado (node_id={self.node_uuid[:8]})")
+
+    def stop(self):
+        self.server.stop()
+        self.discovery.stop()
+        if self.upnp and self.external_ip:
+            try:
+                self.upnp.delete_port_mapping(self.tcp_port, "TCP")
+            except Exception:
+                pass
+
+    def _setup_upnp(self):
+        try:
+            self.upnp = UPnPClient()
+            if not self.upnp.control_url:
+                print("[UPnP] Roteador nao suporta — abra porta manualmente se quiser peers externos")
+                return
+            local_ip = _get_local_ip()
+            ok = self.upnp.add_port_mapping(self.tcp_port, self.tcp_port, local_ip,
+                                             description="BRN Node")
+            if ok:
+                self.external_ip = self.upnp.get_external_ip()
+                print(f"[UPnP] Porta {self.tcp_port} mapeada. IP publico: {self.external_ip}")
+        except Exception:
+            pass
+
+    def _get_peers_for_pex(self):
+        try:
+            return self.discovery.listar_peers_com_altura()
+        except Exception:
+            return []
+
+    def _on_peer_found(self, ip, port):
+        try:
+            resp = P2PClient.get_chain_height(ip, port)
+            if not resp:
+                return
+            remote_work = resp.get("work", 0)
+            local_work = self.bc.cumulative_work()
+            if remote_work > local_work:
+                print(f"[P2P] Peer {ip}:{port} com mais work. Sincronizando...")
+                self.sync_with_peer(ip, port)
+
+            # PEX
+            peers_resp = P2PClient.get_peers(ip, port)
+            if peers_resp and "peers" in peers_resp:
+                novos = 0
+                for p in peers_resp["peers"]:
+                    addr = p.get("address", "") if isinstance(p, dict) else str(p)
+                    if not addr or ":" not in addr:
+                        continue
+                    with self.discovery.peers_lock:
+                        if addr not in self.discovery.discovered_peers:
+                            self.discovery.discovered_peers[addr] = 0
+                            novos += 1
+                if novos > 0:
+                    print(f"[PEX] +{novos} peer(s) via {ip}")
+                    self.discovery._salvar_peers()
+        except Exception:
+            pass
+
+    def sync_with_peer(self, ip, port):
+        resp = P2PClient.get_chain_height(ip, port)
+        if not resp:
+            return
+        remote_height = resp.get("height", -1)
+        remote_work = resp.get("work", 0)
+        local_work = self.bc.cumulative_work()
+        if remote_work <= local_work:
+            print("[P2P] Peer sem mais trabalho.")
+            return
+        local_height = self.bc.db.height()
+        start = max(0, local_height - 50) if local_height > 100 else 0
+        novos = []
+        cursor = start
+        while cursor <= remote_height:
+            end = min(cursor + 50, remote_height + 1)
+            resp = P2PClient.get_blocks_range(ip, port, cursor, end)
+            if not resp or "blocks" not in resp:
+                break
+            novos.extend(resp["blocks"])
+            cursor = end
+        if not novos:
+            return
+        ok, msg = self.bc.reorg_to(novos)
+        if ok:
+            print(f"[P2P] Reorg OK: {msg}")
+        else:
+            print(f"[P2P] Reorg nao aplicado: {msg}")
+
+    def broadcast_block(self, block_dict):
+        for peer in self.discovery.listar_peers():
+            try:
+                ip, port = peer.split(":")
+                threading.Thread(target=P2PClient.send_block,
+                                 args=(ip, int(port), block_dict),
+                                 daemon=True).start()
+            except Exception:
+                pass
+
+    def broadcast_tx(self, tx_dict):
+        for peer in self.discovery.listar_peers():
+            try:
+                ip, port = peer.split(":")
+                threading.Thread(target=P2PClient.send_tx,
+                                 args=(ip, int(port), tx_dict),
+                                 daemon=True).start()
+            except Exception:
+                pass
+
+    def _on_new_block(self, block_dict):
+        try:
+            h = block_dict.get("height", -1)
+            if h == self.bc.db.height() + 1:
+                ok, msg = self.bc.accept_block(block_dict)
+                if ok:
+                    print(f"[P2P] Novo bloco aceito: #{h}")
+                return ok
+            return False
+        except Exception:
+            return False
+
+    def _on_new_tx(self, tx_dict):
+        try:
+            ok, msg = self.bc.submit_tx(tx_dict)
+            if ok:
+                print(f"[P2P] Nova tx: {str(tx_dict.get('txid', '?'))[:16]}")
+            return ok
+        except Exception:
+            return False
+
+    def _on_peer_bad(self, peer_ip):
+        try:
+            novo = self.bc.db.add_peer_score(peer_ip, PEER_SCORE_PENALTY_BAD)
+            if novo <= PEER_SCORE_BAN_THRESHOLD:
+                print(f"[P2P] BANINDO {peer_ip}")
+                self.bc.db.remover_peer_por_endereco(peer_ip)
+        except Exception:
+            pass
+
+    def _on_peer_good(self, peer_ip):
+        try:
+            self.bc.db.add_peer_score(peer_ip, PEER_SCORE_REWARD_GOOD)
+        except Exception:
+            pass
+
+    def get_status(self):
+        peers = self.discovery.listar_peers()
+        return {
+            "node_id": self.node_uuid,
+            "port": self.tcp_port,
+            "external_ip": self.external_ip,
+            "peer_count": len(peers),
+            "peers": peers,
+            "height": self.bc.db.height(),
+            "work": self.bc.cumulative_work(),
+            "bootstrap": list(_carregar_bootstrap()),
+            "github": f"{GH_USER}/{GH_REPO}" if GH_USER else "(desativado)",
+            "tracker": TRACKER_URL or "(desativado)",
+        }
+
+
+if __name__ == "__main__":
+    print("Rode via main.py")
