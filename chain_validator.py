@@ -13,7 +13,6 @@ v6: adiciona verificacao de assinatura Ed25519 em cada tx nao-coinbase,
 ============================================================
 """
 import time
-from typing import Any
 
 
 # ============================================================
@@ -65,10 +64,7 @@ class ChainVerificationResult:
 # v6: HELPERS DE VALIDACAO CRIPTOGRAFICA
 # ============================================================
 def _verify_tx_signature(tx: dict) -> tuple[bool, str]:
-    """
-    Verifica a assinatura de uma tx nao-coinbase.
-    Retorna (ok, motivo). Motivo vazio se ok.
-    """
+    """Verifica assinatura de uma tx nao-coinbase. Retorna (ok, motivo)."""
     from blockchain import signing_hash
     from wallet import Wallet
 
@@ -84,7 +80,6 @@ def _verify_tx_signature(tx: dict) -> tuple[bool, str]:
             return False, f"input[{i}] sem pubkey/assinatura"
         if not Wallet.verify(sig_hash, sig, pk_hex):
             return False, f"input[{i}] assinatura invalida"
-
     return True, ""
 
 
@@ -95,8 +90,8 @@ def _has_required_fields(tx: dict) -> bool:
 
 def _pubkey_matches_from(tx: dict) -> tuple[bool, str]:
     """
-    Bind pubkey -> endereco -> input. Evita ataque onde o atacante
-    troca 'from'/'pubkey' mantendo a assinatura original.
+    Garante que cada pubkey gera um endereco valido. Evita ataque onde
+    o atacante troca 'from'/'pubkey' mantendo a assinatura original.
     """
     from crypto import pubkey_to_address
 
@@ -104,15 +99,10 @@ def _pubkey_matches_from(tx: dict) -> tuple[bool, str]:
         pk_hex = inp.get("pubkey", "")
         if not pk_hex:
             return False, f"input[{i}] sem pubkey"
-        # Se a UTXO que este input gasta tinha endereco, checamos que
-        # a pubkey fornecida gera aquele endereco. Essa checagem final
-        # ja e feita em blockchain.validate_tx via db.get_utxo.
-        # Aqui so garantimos que a pubkey e parseavel e gera um endereco.
         try:
             _ = pubkey_to_address(pk_hex)
         except Exception as e:
             return False, f"input[{i}] pubkey invalida ({e})"
-
     return True, ""
 
 
@@ -136,7 +126,7 @@ def verify_chain(blockchain) -> ChainVerificationResult:
       10. Ausencia de txid duplicada
       11. Ausencia de saldo negativo
       12. Recompensa compativel com halving
-      13. [v6] Assinatura Ed25519 valida em txs nao-coinbase
+      13. [v6] Assinatura Ed25519/ECDSA valida em txs nao-coinbase
       14. [v6] Pubkey corresponde ao 'from'
       15. [v6] Coinbase NAO tem assinatura nem pubkey no input
     """
@@ -263,7 +253,7 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                 result.add_error(f"{prefixo}: txid duplicada {short}...")
             all_txids.add(t["txid"])
 
-            # Coinbase — pula as checagens de assinatura
+            # Coinbase — pula checagens de assinatura
             if idx == 0 and is_cb:
                 continue
 
@@ -276,7 +266,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
             ok_sig, motivo = _verify_tx_signature(t)
             if not ok_sig:
                 result.add_error(f"{prefixo}: tx {short}... {motivo}")
-                # ainda registra UTXOs para nao mascarar gasto duplo
                 for inp in t["inputs"]:
                     spent_utxos.add((inp["txid"], inp["vout"]))
                 continue
