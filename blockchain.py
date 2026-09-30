@@ -4,9 +4,13 @@ Versão: 6.0 | Data: 29/09/2026
 
 Changelog v6.0 (breaking):
 - [CRÍTICO] make_coinbase/build_genesis exigem pubkey na saída.
-- [CRÍTICO] validate_tx exige pubkey EXATA entre input e UTXO.
-- [CRÍTICO] txid() e signing_hash() derivam do MESMO _tx_core().
+            Sem pubkey, o UTXO é NÃO-GASTÁVEL (validate_tx rejeita).
+- [CRÍTICO] validate_tx exige correspondência EXATA entre input.pubkey
+            e utxo.pubkey — sem curto-circuito em pubkey vazia.
+- [CRÍTICO] txid() e signing_hash() agora derivam do MESMO _tx_core().
+            Isso elimina malleabilidade da pubkey no input.
 - [MELHORIA] signing_hash prefixa b"BRN-TX-v1|" (domain separation).
+            Evita reuso de assinatura em outros contextos (P2P, API).
 - [MELHORIA] versão explícita (_CORE_V) na serialização.
 - [API] mine_block e mine_block_interruptible exigem miner_pubkey.
 
@@ -40,14 +44,20 @@ GENESIS_REWARD = INITIAL_REWARD
 GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
 
 # v6: pubkey correspondente ao GENESIS_ADDRESS.
-# Se ficar vazia, a UTXO do gênese é NÃO-GASTÁVEL (validate_tx exige
-# correspondência exata entre input.pubkey e utxo.pubkey).
+# Se ficar vazia, a UTXO do gênese é inerentemente NÃO-GASTÁVEL
+# (o validador exige correspondência exata entre input.pubkey e utxo.pubkey).
+# Defina aqui se quiser gastar as moedas do gênese.
 GENESIS_PUBKEY = ""
 
 # ============================================================
 # v6: DOMAIN SEPARATION
 # ============================================================
+# Prefixo aplicado ao signing_hash. Impede que uma assinatura feita
+# para um contexto (ex.: handshake P2P, autenticação de API) seja
+# reutilizada como assinatura de transação, e vice-versa.
 SIGNING_DOMAIN = b"BRN-TX-v1|"
+
+# v6: versão do layout serializado. Incrementar SEMPRE que _tx_core mudar.
 _CORE_V = 1
 
 
@@ -89,6 +99,12 @@ def _tx_core(tx):
     """
     Núcleo canônico. TUDO que importa para identidade e autoria
     passa por aqui — txid() e signing_hash() usam este mesmo core.
+
+    Regras:
+      - chaves ordenadas (OPT_SORT_KEYS)
+      - pubkey presente em inputs E outputs
+      - height entra só se existir (coinbase)
+      - versão explícita (_CORE_V)
     """
     inputs = [
         {
@@ -129,15 +145,21 @@ def txid(tx):
 
 
 def signing_hash(tx):
-    """Hash efetivamente assinado, com domain separation."""
+    """
+    Hash efetivamente assinado.
+    Prefixado com SIGNING_DOMAIN para evitar cross-protocol replay.
+    """
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
 # ============================================================
-# v6: COINBASE E GÊNESE
+# v6: COINBASE E GÊNESE — pubkey obrigatória
 # ============================================================
 def make_coinbase(address, pubkey_hex, height, reward):
-    """Cria uma coinbase. pubkey_hex é OBRIGATÓRIA."""
+    """
+    Cria uma coinbase.
+    pubkey_hex é OBRIGATÓRIA: sem ela o UTXO é não-gastável.
+    """
     if not pubkey_hex:
         raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     cb = {
@@ -296,28 +318,33 @@ class Blockchain:
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
 
+        # 1) estrutura básica
         if not tx.get("inputs") or not tx.get("outputs"):
             return False, "tx sem inputs/outputs"
         if tx["inputs"][0]["txid"] == "0" * 64:
             return False, "coinbase invalida"
 
+        # 2) txid canônico
         if tx.get("txid") != txid(tx):
             return False, "txid invalido"
 
+        # 3) todo input exige pubkey
         for inp in tx["inputs"]:
             if not inp.get("pubkey"):
                 return False, "input sem pubkey"
 
+        # 4) nonce por pubkey (replay protection)
         tx_nonce = tx.get("nonce", 0)
         for inp in tx["inputs"]:
             pk = inp["pubkey"]
             expected = self.db.get_nonce_for_pubkey(pk)
             if tx_nonce != expected:
                 return False, (
-                    f"nonce invalido para {pk[:16]}... "
+                    f"nonce invalido para {pk[:16]}… "
                     f"(esperado {expected}, recebido {tx_nonce})"
                 )
 
+        # 5) UTXOs + binding pubkey↔UTXO
         in_sum = 0
         seen = set()
         for inp in tx["inputs"]:
@@ -330,19 +357,22 @@ class Blockchain:
             if not u:
                 return False, "UTXO inexistente"
 
+            # v6: SEMPRE exige correspondência exata — sem curto-circuito
             if inp["pubkey"] != u["pubkey"]:
                 return False, (
-                    f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                    f"pubkey mismatch: input={inp['pubkey'][:16]}… "
                     f"utxo={u['pubkey'][:16] if u['pubkey'] else '(vazio)'}"
                 )
             in_sum += u["amount"]
 
+        # 6) somas e fee
         out_sum = sum(o["amount"] for o in tx["outputs"])
         if out_sum > in_sum:
             return False, "outputs > inputs"
         if in_sum - out_sum < MIN_RELAY_FEE:
             return False, "fee abaixo do minimo"
 
+        # 7) assinatura (com domain separation)
         sig_hash = signing_hash(tx)
         for inp in tx["inputs"]:
             if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
@@ -381,14 +411,17 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
+        # coinbase
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
         if cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
+        # v6: toda saída da coinbase precisa de pubkey
         for out in cb["outputs"]:
             if not out.get("pubkey"):
                 return False, "coinbase output sem pubkey"
+        # v6: coinbase não deve ter assinatura no input
         for inp in cb["inputs"]:
             if inp.get("signature"):
                 return False, "coinbase input com assinatura"
@@ -421,7 +454,7 @@ class Blockchain:
         return True, block["hash"]
 
     # --------------------------------------------------------
-    # REORG
+    # REORG (inalterado)
     # --------------------------------------------------------
     def reorg_to(self, new_blocks):
         if not new_blocks:
@@ -480,7 +513,7 @@ class Blockchain:
         return True, f"reorg ok ({len(blocks_to_add)} blocos)"
 
     # --------------------------------------------------------
-    # v6: MINERAÇÃO
+    # v6: MINERAÇÃO — exige miner_pubkey
     # --------------------------------------------------------
     def mine_block(self, miner_address, miner_pubkey):
         height = self.db.height() + 1
@@ -533,7 +566,7 @@ class Blockchain:
         return block if ok else None
 
     # --------------------------------------------------------
-    # CONFIRMAÇÕES
+    # CONFIRMAÇÕES (inalterado)
     # --------------------------------------------------------
     def get_latest_height(self) -> int:
         return self.db.height()
@@ -550,7 +583,7 @@ class Blockchain:
 
 
 # ------------------------------------------------------------
-# Plug do chain_validator
+# Plug do chain_validator (inalterado)
 # ------------------------------------------------------------
 try:
     from chain_validator import verify_chain as _verify_ext
