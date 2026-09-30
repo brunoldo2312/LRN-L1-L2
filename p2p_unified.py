@@ -1,20 +1,20 @@
 """
-p2p_unified.py — BRN P2P Network v6.0
+p2p_unified.py — BRN P2P Network v6.2
 ============================================================
-Novidades v6.0:
+Novidades v6.2:
+  + FIX: P2PClient.send_message agora usa loop de recv ate
+    o JSON estar completo (antes truncava mensagens grandes)
+  + Timeout padrao aumentado para 30s
+
+Herdado da v6.1:
+  + Autenticacao Ed25519 no handshake (via p2p_auth.py)
+
+Herdado da v6.0:
   #6  Sincronizacao incremental (so baixa blocos novos)
   #7  Verificacao de integridade em cada bloco
   #8  Retentativa com backoff exponencial
   #9  Metricas e estatisticas (latencia, taxa, peers)
   #10 Modo somente leitura (BRN_READ_ONLY=1)
-
-Herdado da v5.1:
-  - UUID por porta (2+ nos no mesmo PC)
-  - Sync por cumulative_work
-  - accept_block (valida PoW/merkle)
-  - Peer scoring + Rate limit
-  - Bootstrap + PEX + Tracker + GitHub
-============================================================
 """
 
 import os
@@ -30,6 +30,11 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
+from p2p_auth import (
+    auth_enabled, auth_required, build_auth, verify_auth,
+    set_node_id_priv as _auth_set_priv,
+)
+
 # ============================================================
 # CONFIGURACAO
 # ============================================================
@@ -40,7 +45,7 @@ DISCOVERY_INTERVAL_MIN = 2.0
 DISCOVERY_INTERVAL_MAX = 30.0
 PEER_TIMEOUT    = 60
 PEER_CLEANUP_S  = 30
-MAX_MSG_SIZE    = 2 * 1024 * 1024
+MAX_MSG_SIZE    = 8 * 1024 * 1024
 PROTOCOL_VERSION = "BRN5/1.0"
 NETWORK_MAGIC   = b"BRN5"
 
@@ -74,11 +79,12 @@ BOOTSTRAP_PING_INTERVAL = 60
 
 # ---- v6.0: Novas configs ----
 READ_ONLY          = os.environ.get("BRN_READ_ONLY", "0") == "1"
-SYNC_BATCH_SIZE    = int(os.environ.get("BRN_SYNC_BATCH", "100"))   # #6: lotes maiores
+SYNC_BATCH_SIZE    = int(os.environ.get("BRN_SYNC_BATCH", "50"))
 SYNC_RETRY_MAX     = int(os.environ.get("BRN_SYNC_RETRY_MAX", "5"))
 SYNC_RETRY_BASE_S  = float(os.environ.get("BRN_SYNC_RETRY_BASE", "1.0"))
 SYNC_RETRY_MAX_S   = float(os.environ.get("BRN_SYNC_RETRY_MAX_S", "300.0"))
-SYNC_DEEP_FALLBACK = int(os.environ.get("BRN_SYNC_DEEP_FALLBACK", "200"))  # blocos extras se hash não bate
+SYNC_DEEP_FALLBACK = int(os.environ.get("BRN_SYNC_DEEP_FALLBACK", "200"))
+TCP_TIMEOUT_DEFAULT = float(os.environ.get("BRN_TCP_TIMEOUT", "30.0"))
 
 
 # ============================================================
@@ -160,7 +166,6 @@ def _carregar_bootstrap():
 # #8: BACKOFF EXPONENCIAL
 # ============================================================
 class ExponentialBackoff:
-    """Calcula tempo de espera entre tentativas: base * 2^(n-1), limitado a max."""
     def __init__(self, base=1.0, max_s=300.0, jitter=0.1):
         self.base = base
         self.max_s = max_s
@@ -171,7 +176,6 @@ class ExponentialBackoff:
         self.attempts += 1
         exp = self.base * (2 ** (self.attempts - 1))
         exp = min(exp, self.max_s)
-        # jitter para evitar sincronização de tentativas
         import random
         jit = exp * self.jitter * (random.random() * 2 - 1)
         return max(0.1, exp + jit)
@@ -187,7 +191,6 @@ class ExponentialBackoff:
 # #9: METRICAS
 # ============================================================
 class Metrics:
-    """Contadores thread-safe de operações P2P."""
     def __init__(self):
         self._lock = threading.Lock()
         self.start_time = time.time()
@@ -209,6 +212,8 @@ class Metrics:
             "sync_blocks_applied": 0,
             "last_sync_duration_ms": 0.0,
             "last_sync_height": 0,
+            "auth_ok": 0,
+            "auth_failed": 0,
         }
         self.peer_metrics = defaultdict(lambda: {
             "last_seen": 0,
@@ -293,7 +298,7 @@ def _gh_ler_peers():
 
 def _gh_escrever_peers(peers):
     if READ_ONLY:
-        return False  # #10: em modo leitura não publica
+        return False
     if not (GH_USER and GH_REPO and GH_TOKEN):
         return False
     sha = None
@@ -356,7 +361,7 @@ def _peers_do_tracker():
 
 
 # ============================================================
-# UPnP (inalterado)
+# UPnP
 # ============================================================
 class UPnPClient:
     def __init__(self, timeout=3.0):
@@ -478,7 +483,7 @@ class UPnPClient:
 
 
 # ============================================================
-# SERVIDOR TCP (com metricas)
+# SERVIDOR TCP
 # ============================================================
 class P2PServer(threading.Thread):
     def __init__(self, blockchain, port, metrics, on_new_block=None, on_new_tx=None,
@@ -487,6 +492,7 @@ class P2PServer(threading.Thread):
         self.bc = blockchain
         self.port = port
         self.metrics = metrics
+        self.node_id_priv = None
         self.on_new_block = on_new_block
         self.on_new_tx = on_new_tx
         self.on_peer_bad = on_peer_bad
@@ -515,6 +521,31 @@ class P2PServer(threading.Thread):
             janela.append(agora)
             return True
 
+    def _recv_message(self, conn, timeout=30.0):
+        """
+        Le uma mensagem completa do socket: le ate o JSON estar valido.
+        Corrige o bug de recv() unico que truncava mensagens grandes.
+        """
+        conn.settimeout(timeout)
+        raw = b""
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                return None
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > MAX_MSG_SIZE:
+                return None
+            if raw.startswith(NETWORK_MAGIC):
+                try:
+                    json.loads(raw[len(NETWORK_MAGIC):].decode())
+                    break
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+        return raw
+
     def run(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -538,28 +569,53 @@ class P2PServer(threading.Thread):
                     print(f"[P2P] Erro no accept: {e}")
 
     def _handle_conn(self, conn, addr):
+        peer_ip = addr[0]
         try:
-            peer_ip = addr[0]
             if not self._check_rate(peer_ip):
                 return
             score = self.bc.db.get_peer_score(peer_ip)
             if score <= PEER_SCORE_BAN_THRESHOLD:
                 return
-            conn.settimeout(15)
-            raw = conn.recv(MAX_MSG_SIZE)
+
+            raw = self._recv_message(conn, timeout=30.0)
             if not raw or not raw.startswith(NETWORK_MAGIC):
                 return
+
             self.metrics.inc("messages_in")
             self.metrics.inc("bytes_in", len(raw))
             msg = json.loads(raw[len(NETWORK_MAGIC):].decode())
+
+            # ============ AUTENTICACAO Ed25519 ============
+            _auth = msg.pop("_auth", None)
+            if auth_enabled():
+                if _auth:
+                    ok, err = verify_auth(_auth)
+                    if not ok:
+                        print(f"[Auth] {peer_ip}: REJEITADO - {err}")
+                        self.metrics.inc("auth_failed")
+                        return
+                    print(f"[Auth] {peer_ip}: OK pub={_auth['pub'][:16]}...")
+                    self.metrics.inc("auth_ok")
+                elif auth_required():
+                    print(f"[Auth] {peer_ip}: REJEITADO - sem auth (required)")
+                    self.metrics.inc("auth_failed")
+                    return
+                else:
+                    print(f"[Auth] {peer_ip}: aceito SEM auth (optional)")
+
             response = self._process_message(msg, addr)
             if response:
+                if auth_enabled():
+                    try:
+                        response["_auth"] = build_auth()
+                    except Exception as e:
+                        print(f"[Auth] falha ao assinar resposta: {e}")
+
                 payload = NETWORK_MAGIC + json.dumps(response).encode()
                 conn.sendall(payload)
                 self.metrics.inc("messages_out")
                 self.metrics.inc("bytes_out", len(payload))
         except Exception as e:
-            self.metrics.peer_update(peer_ip, errors=1)
             print(f"[P2P] Erro com {addr}: {e}")
         finally:
             try:
@@ -586,13 +642,11 @@ class P2PServer(threading.Thread):
             if mtype == "get_blocks_range":
                 start = int(msg.get("start", 0))
                 end = int(msg.get("end", start + 50))
-                # limita a SYNC_BATCH_SIZE
                 end = min(end, start + SYNC_BATCH_SIZE)
                 blocks = self.bc.db.get_blocks_range(start, end)
                 self.metrics.peer_add_tokens(peer_ip, len(blocks))
                 return {"type": "blocks_range", "blocks": blocks}
             if mtype == "new_block":
-                # #10: modo somente leitura NAO aceita blocos novos via P2P
                 if READ_ONLY:
                     return {"type": "ack", "ok": False, "reason": "read_only"}
                 block_dict = msg.get("block")
@@ -628,25 +682,75 @@ class P2PServer(threading.Thread):
 
 
 # ============================================================
-# CLIENTE TCP (com medicao de latencia)
+# CLIENTE TCP (com recv corrigido)
 # ============================================================
 class P2PClient:
     @staticmethod
-    def send_message(ip, port, message, timeout=5.0):
+    def send_message(ip, port, message, timeout=None):
+        """
+        Envia mensagem e le a resposta completa.
+        timeout padrao = TCP_TIMEOUT_DEFAULT (30s).
+        """
+        if timeout is None:
+            timeout = TCP_TIMEOUT_DEFAULT
+
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             t0 = time.time()
             s.connect((ip, port))
+
+            # assinar request
+            if auth_enabled():
+                try:
+                    message = dict(message)
+                    message["_auth"] = build_auth()
+                except Exception as e:
+                    print(f"[Auth] falha ao assinar request: {e}")
+
             payload = NETWORK_MAGIC + json.dumps(message).encode()
             s.sendall(payload)
-            raw = s.recv(MAX_MSG_SIZE)
+
+            # ✅ CORRECAO: loop de recv ate o JSON estar completo
+            raw = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                raw += chunk
+                if len(raw) > MAX_MSG_SIZE:
+                    break
+                if raw.startswith(NETWORK_MAGIC):
+                    try:
+                        json.loads(raw[len(NETWORK_MAGIC):].decode())
+                        break
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+
             latency_ms = (time.time() - t0) * 1000
             s.close()
+
             if raw.startswith(NETWORK_MAGIC):
-                return json.loads(raw[len(NETWORK_MAGIC):].decode()), latency_ms
+                resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
+
+                # verificar auth da resposta
+                if auth_enabled():
+                    _rauth = resp.pop("_auth", None)
+                    if _rauth:
+                        ok, err = verify_auth(_rauth)
+                        if not ok:
+                            print(f"[Auth] resposta de {ip} REJEITADA - {err}")
+                            return None, latency_ms
+                    elif auth_required():
+                        print(f"[Auth] resposta de {ip} SEM auth (required)")
+                        return None, latency_ms
+
+                return resp, latency_ms
             return None, latency_ms
-        except Exception:
+        except Exception as e:
             return None, 0.0
 
     @staticmethod
@@ -679,7 +783,7 @@ class P2PClient:
 
 
 # ============================================================
-# DESCOBERTA (inalterada da v5.1)
+# DESCOBERTA
 # ============================================================
 class PeerDiscovery:
     def __init__(self, tcp_port, node_uuid, on_peer_found=None, blockchain=None):
@@ -1039,11 +1143,13 @@ class PeerDiscovery:
 
 
 # ============================================================
-# MANAGER (com #6, #7, #8, #9, #10)
+# MANAGER
 # ============================================================
 class P2PManager:
-    def __init__(self, blockchain, tcp_port=TCP_PORT_DEFAULT, enable_upnp=True):
+    def __init__(self, blockchain, node_id_priv=None,
+                 tcp_port=TCP_PORT_DEFAULT, enable_upnp=True):
         self.bc = blockchain
+        self.node_id_priv = node_id_priv
         self.tcp_port = tcp_port
         self.enable_upnp = enable_upnp
         self.read_only = READ_ONLY
@@ -1052,7 +1158,11 @@ class P2PManager:
         self.external_ip = None
         self.upnp = None
 
-        # #8: backoff por peer
+        if node_id_priv is not None:
+            _auth_set_priv(node_id_priv)
+            pub_hex = node_id_priv.public_key().public_bytes_raw().hex()
+            print(f"[Auth] node_id_priv registrado (pub={pub_hex[:16]}...)")
+
         self._backoffs = defaultdict(lambda: ExponentialBackoff(
             base=SYNC_RETRY_BASE_S, max_s=SYNC_RETRY_MAX_S
         ))
@@ -1110,7 +1220,6 @@ class P2PManager:
             return []
 
     def _on_peer_found(self, ip, port):
-        """Chamado quando um novo peer é descoberto. Dispara sync."""
         try:
             resp, latency = P2PClient.get_chain_height(ip, port)
             if not resp:
@@ -1120,7 +1229,6 @@ class P2PManager:
             local_work = self.bc.cumulative_work()
             if remote_work > local_work:
                 print(f"[P2P] Peer {ip}:{port} com mais work ({remote_work} > {local_work}). Sincronizando...")
-                # #8: usa thread separada com backoff
                 threading.Thread(
                     target=self._sync_with_retry,
                     args=(ip, port),
@@ -1128,7 +1236,6 @@ class P2PManager:
                     name=f"Sync-{ip}-{port}",
                 ).start()
 
-            # PEX — pede lista de peers
             peers_resp, _ = P2PClient.get_peers(ip, port)
             if peers_resp and "peers" in peers_resp:
                 novos = 0
@@ -1146,16 +1253,12 @@ class P2PManager:
         except Exception:
             pass
 
-    # ============================================================
-    # #6 #7 #8: SINCRONIZACAO INCREMENTAL COM VERIFICACAO E BACKOFF
-    # ============================================================
     def _sync_with_retry(self, ip, port):
-        """Loop de sync com backoff exponencial (#8)."""
         addr = f"{ip}:{port}"
         backoff = self._backoffs[addr]
         self.metrics.inc("sync_runs")
 
-        while not self.read_only or True:  # read-only também sincroniza
+        while True:
             try:
                 ok, msg = self._sync_incremental(ip, port)
                 if ok:
@@ -1166,34 +1269,24 @@ class P2PManager:
                     if "sem mais trabalho" in msg or "nada novo" in msg:
                         self.metrics.inc("sync_success")
                         return
-                    # retry
                     self.metrics.inc("sync_failed")
                     if backoff.give_up(SYNC_RETRY_MAX):
                         print(f"[Sync] Desistindo de {addr} apos {SYNC_RETRY_MAX} tentativas ({msg})")
                         return
                     wait = backoff.next_sleep()
-                    print(f"[Sync] {addr} falhou ({msg}), retry em {wait:.1f}s "
-                          f"(tentativa {backoff.attempts}/{SYNC_RETRY_MAX})")
+                    print(f"[Sync] {addr} falhou ({msg}), retry em {wait:.1f}s")
                     time.sleep(wait)
             except Exception as e:
                 self.metrics.inc("sync_failed")
                 if backoff.give_up(SYNC_RETRY_MAX):
-                    print(f"[Sync] Desistindo de {addr}: {e}")
                     return
                 wait = backoff.next_sleep()
-                print(f"[Sync] {addr} exception ({e}), retry em {wait:.1f}s")
                 time.sleep(wait)
 
     def _sync_incremental(self, ip, port):
-        """
-        #6: baixa apenas blocos novos, nao toda a cadeia.
-        #7: valida cada bloco antes de aceitar.
-        Retorna (ok, msg).
-        """
         t0 = time.time()
         addr = f"{ip}:{port}"
 
-        # 1) Pega estado remoto
         resp, latency = P2PClient.get_chain_height(ip, port)
         if not resp:
             return False, "peer nao respondeu"
@@ -1201,26 +1294,19 @@ class P2PManager:
 
         remote_height = resp.get("height", -1)
         remote_work = resp.get("work", 0)
-        remote_tip = resp.get("hash", "")
 
-        # 2) Estado local
         local_height = self.bc.db.height()
         local_work = self.bc.cumulative_work()
-        local_tip = self.bc.db.tip_hash()
 
         if remote_work <= local_work and remote_height <= local_height:
             return True, "sem mais trabalho"
 
-        # 3) #6: começa do local_height + 1
         start = local_height + 1
         if start > remote_height:
-            # local mais alto que remoto — nao há nada a baixar
             return True, "nada novo"
 
-        print(f"[Sync] {addr}: {local_height} -> {remote_height} "
-              f"({remote_height - local_height} blocos, {SYNC_BATCH_SIZE}/lote)")
+        print(f"[Sync] {addr}: {local_height} -> {remote_height}")
 
-        # 4) Baixa em lotes
         blocks_to_apply = []
         cursor = start
         while cursor <= remote_height:
@@ -1230,7 +1316,6 @@ class P2PManager:
                 return False, f"falha no lote {cursor}-{end}"
             lote = resp["blocks"]
             if not lote:
-                # peer mentiu sobre altura — para
                 break
             self.metrics.peer_update(addr, latency_ms=lat, tokens_sent=0)
             blocks_to_apply.extend(lote)
@@ -1239,7 +1324,6 @@ class P2PManager:
         if not blocks_to_apply:
             return False, "nenhum bloco recebido"
 
-        # 5) #7: valida cada bloco na sequência correta
         prev = self.bc.db.get_block(local_height)
         prev_hash = prev["hash"] if prev else "0" * 64
         expected_height = local_height + 1
@@ -1256,43 +1340,35 @@ class P2PManager:
                 if blk.get("prev_hash") != prev_hash:
                     rejeitados += 1
                     break
-                # Recalcula hash
                 h_recalc = block_hash(
                     blk["prev_hash"], blk["merkle"], blk["timestamp"],
                     blk["nonce"], blk["difficulty"]
                 )
                 if h_recalc != blk["hash"]:
-                    print(f"[Sync] BLOCO ADULTERADO #{blk['height']} (hash nao bate)")
                     rejeitados += 1
                     break
-                # Confere PoW
                 if not meets_difficulty(blk["hash"], blk["difficulty"]):
-                    print(f"[Sync] PoW invalido #{blk['height']}")
                     rejeitados += 1
                     break
-                # Confere merkle
                 txids = [t["txid"] for t in blk["transactions"]]
                 if compute_merkle_root(txids) != blk["merkle"]:
-                    print(f"[Sync] merkle invalido #{blk['height']}")
                     rejeitados += 1
                     break
                 prev_hash = blk["hash"]
                 expected_height += 1
                 validos += 1
-            except Exception as e:
-                print(f"[Sync] erro validando bloco: {e}")
+            except Exception:
                 rejeitados += 1
                 break
 
         if rejeitados > 0:
             self.metrics.inc("blocks_rejected", rejeitados)
-            return False, f"{rejeitados} blocos rejeitados na verificacao"
+            return False, f"{rejeitados} blocos rejeitados"
 
         self.metrics.inc("blocks_received", len(blocks_to_apply))
         self.metrics.inc("blocks_accepted", validos)
         self.metrics.peer_update(addr, blocks_contributed=validos)
 
-        # 6) Aplica via reorg_to (que internamente valida e ordena)
         ok, msg = self.bc.reorg_to(blocks_to_apply)
         dt_ms = (time.time() - t0) * 1000
         self.metrics.set("last_sync_duration_ms", round(dt_ms, 1))
@@ -1300,19 +1376,14 @@ class P2PManager:
         self.metrics.inc("sync_blocks_applied", validos)
 
         if ok:
-            print(f"[Sync] {addr}: OK — +{validos} blocos em {dt_ms:.0f}ms "
-                  f"(altura {self.bc.db.height()})")
+            print(f"[Sync] {addr}: OK — +{validos} blocos em {dt_ms:.0f}ms")
         else:
             print(f"[Sync] {addr}: reorg nao aplicado ({msg})")
         return ok, msg
 
-    # Compatibilidade com v5.1
     def sync_with_peer(self, ip, port):
         return self._sync_incremental(ip, port)
 
-    # ============================================================
-    # BROADCAST
-    # ============================================================
     def broadcast_block(self, block_dict):
         if self.read_only:
             return
@@ -1328,7 +1399,6 @@ class P2PManager:
                 pass
 
     def broadcast_tx(self, tx_dict):
-        # em read-only ainda propagamos txs (nó relay)
         for peer in self.discovery.listar_peers():
             try:
                 ip, port = peer.split(":")
@@ -1340,9 +1410,6 @@ class P2PManager:
             except Exception:
                 pass
 
-    # ============================================================
-    # HANDLERS DE MENSAGEM
-    # ============================================================
     def _on_new_block(self, block_dict):
         try:
             h = block_dict.get("height", -1)
@@ -1385,9 +1452,6 @@ class P2PManager:
         except Exception:
             pass
 
-    # ============================================================
-    # STATUS E METRICAS
-    # ============================================================
     def get_status(self):
         peers = self.discovery.listar_peers()
         return {
@@ -1406,15 +1470,12 @@ class P2PManager:
         }
 
     def get_metrics(self):
-        """#9: retorna todas as metricas coletadas."""
         return self.metrics.snapshot()
 
     def get_peer_stats(self):
-        """Retorna métricas por peer (latência, blocos contribuídos)."""
         return self.discovery.listar_peers_com_altura()
 
     def is_read_only(self):
-        """#10: informa se o nó está em modo somente leitura."""
         return self.read_only
 
 
