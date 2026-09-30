@@ -1,7 +1,14 @@
 """
-main.py — Entrypoint unificado do no BRN (v8.3)
+main.py — Entrypoint unificado do no BRN (v6.0)
 ============================================================
-Features:
+v6.0 (breaking):
+  - Identidade Ed25519 do no carregada/criada ANTES do P2P.
+  - Senha do no: --password-file > --password > BRN_NODE_PASSWORD > prompt.
+  - Removida senha hardcoded da carteira (BRN_WEB_PASS obrigatoria via env).
+  - P2PManager recebe node_id_priv (handshake autenticado E2P).
+  - --rotate-node-id para gerar nova identidade (backup automatico).
+
+Features herdadas:
   --status        Diagnostico completo e sai
   --headless      Sem interface grafica
   --read-only     Nao minera, nao publica no GitHub
@@ -32,6 +39,12 @@ _shutdown = threading.Event()
 
 
 # ============================================================
+# CAMINHO DA IDENTIDADE DO NO (v6)
+# ============================================================
+NODE_ID_PATH = Path("node_identity.enc")
+
+
+# ============================================================
 # ARGUMENTOS
 # ============================================================
 def parse_args():
@@ -44,7 +57,104 @@ def parse_args():
     p.add_argument("--config", default="config.json", help="Arquivo de configuracao")
     p.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
     p.add_argument("--log-file", default=None, help="Log JSON neste arquivo")
+
+    # v6 — chave do no
+    p.add_argument(
+        "--password", default=None,
+        help="Senha do no (identidade Ed25519). Se omitida, usa "
+             "BRN_NODE_PASSWORD do ambiente ou prompt interativo."
+    )
+    p.add_argument(
+        "--password-file", default=None,
+        help="Le a senha deste arquivo (mais seguro que --password)."
+    )
+    p.add_argument(
+        "--rotate-node-id", action="store_true",
+        help="Apaga a identidade atual (com backup) e gera uma nova. "
+             "CUIDADO: peers antigos nao vao reconhecer este no."
+    )
     return p.parse_args()
+
+
+# ============================================================
+# v6: RESOLUCAO DE SENHA DO NO
+# ============================================================
+def _resolve_password(args) -> str:
+    """
+    Ordem de prioridade:
+      1. --password-file (le conteudo, mantendo espacos internos)
+      2. --password
+      3. Variavel de ambiente BRN_NODE_PASSWORD
+      4. Prompt interativo (somente se stdin for TTY)
+    """
+    if args.password_file:
+        p = Path(args.password_file)
+        if not p.exists():
+            raise SystemExit(f"--password-file nao encontrado: {p}")
+        # rstrip apenas do \n final — espaços internos sao validos
+        return p.read_text(encoding="utf-8").rstrip("\r\n")
+
+    if args.password:
+        return args.password
+
+    env = os.environ.get("BRN_NODE_PASSWORD")
+    if env:
+        return env
+
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("Senha do no (identidade Ed25519): ")
+
+    raise SystemExit(
+        "Senha do no nao informada.\n"
+        "Use --password-file, --password, ou defina BRN_NODE_PASSWORD."
+    )
+
+
+# ============================================================
+# v6: IDENTIDADE Ed25519 DO NO (E2P)
+# ============================================================
+def load_or_create_node_identity(password: str, rotate: bool = False):
+    """
+    Carrega a identidade Ed25519 do no. Se nao existir (ou rotate=True),
+    gera uma nova e salva cifrada com a senha.
+
+    Retorna (Ed25519PrivateKey, pubkey_hex).
+    """
+    from crypto import Ed25519PrivateKey
+    from secure_store import save_wallet, load_wallet
+
+    log = get_logger("identity")
+
+    if rotate and NODE_ID_PATH.exists():
+        backup = NODE_ID_PATH.with_suffix(".enc.bak")
+        NODE_ID_PATH.replace(backup)
+        log.warning(f"Identidade rotacionada. Backup em {backup}")
+
+    if NODE_ID_PATH.exists():
+        try:
+            data = load_wallet(str(NODE_ID_PATH), password)
+        except Exception as e:
+            raise SystemExit(
+                f"Falha ao decifrar {NODE_ID_PATH}: {e}\n"
+                f"Senha errada? Arquivo corrompido?\n"
+                f"Use --rotate-node-id para gerar uma nova identidade "
+                f"(voce perdera o reconhecimento nos peers)."
+            )
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+        pub_hex = data["pub"]
+        log.info(f"Identidade carregada: {pub_hex[:16]}…")
+        return sk, pub_hex
+
+    # Primeira vez: gera e salva
+    sk = Ed25519PrivateKey.generate()
+    pub_hex = sk.public_key().public_bytes_raw().hex()
+    save_wallet(str(NODE_ID_PATH), {
+        "sk": sk.private_bytes_raw().hex(),
+        "pub": pub_hex,
+    }, password)
+    log.info(f"Identidade nova criada: {pub_hex[:16]}… ({NODE_ID_PATH})")
+    return sk, pub_hex
 
 
 # ============================================================
@@ -138,6 +248,14 @@ def do_status(cfg):
         except Exception as e:
             print(f"  DB height   : erro ({e})")
     print()
+
+    # v6: status da identidade do no
+    print(f"  Node ID     : ", end="")
+    if NODE_ID_PATH.exists():
+        print(f"{NODE_ID_PATH} ({os.path.getsize(NODE_ID_PATH)} bytes)")
+    else:
+        print("(nao criada ainda — sera criada no proximo boot)")
+
     live = _try_local_api(cfg["web_port"])
     if live:
         print("  No rodando  : SIM")
@@ -197,14 +315,26 @@ def run_status_loop(chain, p2p):
 
 def run_wallet_main_thread():
     try:
-        os.environ.setdefault("BRN_WEB_PASS", "carteira123")
+        # v6: BRN_WEB_PASS DEVE vir do ambiente. Nunca default hardcoded.
+        if not os.environ.get("BRN_WEB_PASS"):
+            get_logger("wallet").error(
+                "BRN_WEB_PASS nao definida. Defina a senha da carteira "
+                "como variavel de ambiente antes de iniciar o no:\n"
+                "  export BRN_WEB_PASS='sua-senha-forte'   (Linux/macOS)\n"
+                "  set BRN_WEB_PASS=sua-senha-forte        (Windows CMD)\n"
+                "  $env:BRN_WEB_PASS='sua-senha-forte'     (PowerShell)"
+            )
+            return
+
         from app_wallet_v3 import WalletApi
         import webview
+
         log = get_logger("wallet")
         index_path = Path(__file__).parent / "index_wallet.html"
         if not index_path.exists():
             log.error(f"index_wallet.html nao encontrado: {index_path}")
             return
+
         api = WalletApi()
         log.info("Abrindo janela desktop (main thread)")
         webview.create_window(
@@ -278,6 +408,23 @@ def main():
     except Exception:
         pass
 
+    # ============================================================
+    # v6: IDENTIDADE Ed25519 DO NO — ANTES do P2P
+    # ============================================================
+    node_password = _resolve_password(args)
+    try:
+        node_id_priv, node_id_pub = load_or_create_node_identity(
+            node_password, rotate=args.rotate_node_id
+        )
+    finally:
+        # limpa a senha do escopo o quanto antes
+        try:
+            del node_password
+        except Exception:
+            pass
+
+    log.info(f"No ID (pubkey): {node_id_pub}")
+
     # Import tardio (apos config)
     from blockchain import Blockchain
     from p2p_unified import P2PManager
@@ -287,9 +434,17 @@ def main():
     chain = Blockchain(db_path)
     log.info(f"Altura atual: {chain.db.height()}")
 
-    p2p = P2PManager(chain, tcp_port=cfg["p2p_port"], enable_upnp=cfg["upnp"])
+    # v6: P2PManager recebe node_id_priv (2o argumento posicional).
+    # Ele usa para assinar o handshake X25519 (autentica este no) e para
+    # derivar a chave de sessao por peer.
+    p2p = P2PManager(
+        chain,
+        node_id_priv,
+        tcp_port=cfg["p2p_port"],
+        enable_upnp=cfg["upnp"],
+    )
     p2p.start()
-    log.info(f"P2P porta {cfg['p2p_port']}")
+    log.info(f"P2P porta {cfg['p2p_port']} | No ID: {node_id_pub[:16]}…")
 
     threading.Thread(target=run_http,     daemon=True, name="HTTP").start()
     threading.Thread(target=run_explorer, daemon=True, name="Explorer").start()
