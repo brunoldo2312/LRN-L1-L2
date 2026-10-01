@@ -1,7 +1,11 @@
 """
-p2p_unified.py — BRN P2P Network v6.2
+p2p_unified.py — BRN P2P Network v6.3
 ============================================================
-Novidades v6.2:
+Novidades v6.3:
+  + PATCH: registra peers no banco SQLite (para a carteira
+    enxergar Peers > 0)
+
+Herdado da v6.2:
   + FIX: P2PClient.send_message agora usa loop de recv ate
     o JSON estar completo (antes truncava mensagens grandes)
   + Timeout padrao aumentado para 30s
@@ -160,6 +164,32 @@ def _carregar_bootstrap():
         if p:
             peers.add(p)
     return peers
+
+
+# ============================================================
+# PATCH v6.3: Registra peer no banco SQLite
+# ============================================================
+def _registrar_peer_no_db(blockchain, ip, port):
+    """
+    Insere/atualiza o peer na tabela SQLite `peers`.
+    Sem isto, /api/status retorna peers=0 mesmo com peers ativos.
+    """
+    if blockchain is None:
+        return
+    try:
+        addr = f"{ip}:{port}"
+        genesis = blockchain.db.get_meta("genesis_hash") or ""
+        blockchain.db.upsert_peer(
+            node_id=f"peer-{ip}",
+            address=addr,
+            genesis_hash=genesis,
+            version=PROTOCOL_VERSION,
+            height=0,
+            is_miner=False,
+            public_key="",
+        )
+    except Exception as e:
+        print(f"[P2P] Aviso: falha ao registrar peer no DB: {e}")
 
 
 # ============================================================
@@ -522,10 +552,6 @@ class P2PServer(threading.Thread):
             return True
 
     def _recv_message(self, conn, timeout=30.0):
-        """
-        Le uma mensagem completa do socket: le ate o JSON estar valido.
-        Corrige o bug de recv() unico que truncava mensagens grandes.
-        """
         conn.settimeout(timeout)
         raw = b""
         while True:
@@ -585,7 +611,9 @@ class P2PServer(threading.Thread):
             self.metrics.inc("bytes_in", len(raw))
             msg = json.loads(raw[len(NETWORK_MAGIC):].decode())
 
-            # ============ AUTENTICACAO Ed25519 ============
+            # PATCH v6.3: registra peer no DB (aceita conexao de entrada)
+            _registrar_peer_no_db(self.bc, peer_ip, msg.get("_port", 6001))
+
             _auth = msg.pop("_auth", None)
             if auth_enabled():
                 if _auth:
@@ -687,10 +715,6 @@ class P2PServer(threading.Thread):
 class P2PClient:
     @staticmethod
     def send_message(ip, port, message, timeout=None):
-        """
-        Envia mensagem e le a resposta completa.
-        timeout padrao = TCP_TIMEOUT_DEFAULT (30s).
-        """
         if timeout is None:
             timeout = TCP_TIMEOUT_DEFAULT
 
@@ -700,7 +724,6 @@ class P2PClient:
             t0 = time.time()
             s.connect((ip, port))
 
-            # assinar request
             if auth_enabled():
                 try:
                     message = dict(message)
@@ -711,7 +734,6 @@ class P2PClient:
             payload = NETWORK_MAGIC + json.dumps(message).encode()
             s.sendall(payload)
 
-            # ✅ CORRECAO: loop de recv ate o JSON estar completo
             raw = b""
             while True:
                 try:
@@ -736,7 +758,6 @@ class P2PClient:
             if raw.startswith(NETWORK_MAGIC):
                 resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
 
-                # verificar auth da resposta
                 if auth_enabled():
                     _rauth = resp.pop("_auth", None)
                     if _rauth:
@@ -995,7 +1016,7 @@ class PeerDiscovery:
         if not GH_TOKEN:
             print("[GitHub] BRN_GH_TOKEN vazio - so leitura")
         if READ_ONLY:
-            print("[GitHub] modo READ_ONLY — nao publica")
+            print("[GitHub] modo READ_ONLY - nao publica")
         print(f"[GitHub] Loop iniciado - {GH_USER}/{GH_REPO}/{GH_FILE} @ {GH_BRANCH}")
 
         public_ip = _get_public_ip()
@@ -1220,6 +1241,12 @@ class P2PManager:
             return []
 
     def _on_peer_found(self, ip, port):
+        # ========================================================
+        # PATCH v6.3: registra peer no banco SQLite para a
+        # carteira web enxergar (antes ficava sempre 0)
+        # ========================================================
+        _registrar_peer_no_db(self.bc, ip, port)
+
         try:
             resp, latency = P2PClient.get_chain_height(ip, port)
             if not resp:
@@ -1369,7 +1396,26 @@ class P2PManager:
         self.metrics.inc("blocks_accepted", validos)
         self.metrics.peer_update(addr, blocks_contributed=validos)
 
-        ok, msg = self.bc.reorg_to(blocks_to_apply)
+        ok = True
+        msg = "ok"
+        applied = 0
+        for blk in blocks_to_apply:
+            expected_h = self.bc.db.height() + 1
+            expected_prev = self.bc.db.tip_hash()
+            if blk["height"] != expected_h:
+                ok = False
+                msg = f"bloco #{blk['height']} fora de sequencia (esperado #{expected_h})"
+                break
+            if blk["prev_hash"] != expected_prev:
+                ok = False
+                msg = f"prev_hash diverge em #{blk['height']}"
+                break
+            ok_blk, msg_blk = self.bc.accept_block(blk)
+            if not ok_blk:
+                ok = False
+                msg = f"bloco #{blk['height']}: {msg_blk}"
+                break
+            applied += 1
         dt_ms = (time.time() - t0) * 1000
         self.metrics.set("last_sync_duration_ms", round(dt_ms, 1))
         self.metrics.set("last_sync_height", self.bc.db.height())
