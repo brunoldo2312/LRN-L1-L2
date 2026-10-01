@@ -1,4 +1,5 @@
-
+set BRN_NODE_PASSWORD=senha-do-no-laban-2026
+set BRN_NODE_PASSWORD=senha-do-no-mayra-2026
 ┌─────────────────────────────────────────────────────┐
 │ 1️⃣ Ao iniciar o programa                             │
 │     ↓                                                │
