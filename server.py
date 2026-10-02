@@ -1,4 +1,7 @@
-"""server.py — Backend HTTP do no BRN (v8.6)
+"""server.py — Backend HTTP do no BRN (v8.7)
+v8.7: _pubkey_from_db_or_payload agora consulta tambem current_wallet.json
+      (persistido pelo app_wallet_v3 v3.4.3). Corrige bug onde carteiras
+      recem-geradas nao conseguiam minerar.
 v8.6: + /api/minhas-txs/<addr> (lista txs com direcao/status/conf)
       + fallback robusto em /api/transacoes (try/except por bloco)
 v8.5: _pubkey_from_db_or_payload consulta user_wallets.json, aceita
@@ -26,6 +29,7 @@ CORS(app)
 
 CHAIN = Blockchain("brn_v2_chain.db")
 WALLETS_FILE = "user_wallets.json"
+CURRENT_WALLET_FILE = "current_wallet.json"
 
 # ============================================================
 # CONFIG
@@ -104,40 +108,61 @@ def salvar_wallets(w):
         json.dump(w, f, indent=2)
 
 
+def _registrar_pubkey(addr, pk):
+    """Grava em user_wallets.json se ainda nao estiver la."""
+    if not addr or not pk:
+        return
+    try:
+        wallets = carregar_wallets()
+        if wallets.get(addr, {}).get("public_key") != pk:
+            wallets[addr] = {"public_key": pk}
+            salvar_wallets(wallets)
+    except Exception:
+        pass
+
+
 # ============================================================
-# v8.5: RESOLUCAO DA PUBKEY (4 fontes + derivacao)
+# v8.7: RESOLUCAO DA PUBKEY (5 fontes + derivacao)
 # ============================================================
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
                                payload_sk: str = "") -> str:
     """
-    Retorna a pubkey do endereco. Ordem de prioridade:
-      1. payload_pubkey (frontend manda)
-      2. payload_sk   -> deriva pubkey e confere endereco
-      3. user_wallets.json
-      4. tabela utxos via get_utxos() (thread-safe)
+    v8.7: ordem de prioridade ampliada.
+      1. payload_pubkey          (JS manda no POST)
+      2. payload_sk -> deriva    (JS manda no POST)
+      3. current_wallet.json     (persistido pelo app_wallet_v3)
+      4. user_wallets.json       (persistido por /api/nova-carteira)
+      5. tabela utxos            (se a carteira ja minerou/recebeu)
     """
-    # 1) Payload
+    # 1) Payload pubkey
     if payload_pubkey:
         return payload_pubkey.strip()
 
-    # 2) Derivar da private key
+    # 2) Payload private_key -> deriva pubkey
     if payload_sk:
         try:
             _w = Wallet(private_key_hex=payload_sk.strip())
             if _w.address == addr:
                 pk = _w.pub_hex
-                try:
-                    wallets = carregar_wallets()
-                    if wallets.get(addr, {}).get("public_key") != pk:
-                        wallets[addr] = {"public_key": pk}
-                        salvar_wallets(wallets)
-                except Exception:
-                    pass
+                _registrar_pubkey(addr, pk)
                 return pk
         except Exception:
             pass
 
-    # 3) user_wallets.json
+    # 3) current_wallet.json (pywebview)
+    try:
+        if os.path.exists(CURRENT_WALLET_FILE):
+            with open(CURRENT_WALLET_FILE, "r", encoding="utf-8") as f:
+                cw = json.load(f)
+            if (cw.get("address") or "").strip() == addr:
+                pk = (cw.get("public_key") or cw.get("pubkey") or "").strip()
+                if pk:
+                    _registrar_pubkey(addr, pk)
+                    return pk
+    except Exception:
+        pass
+
+    # 4) user_wallets.json
     try:
         wallets = carregar_wallets()
         entry = wallets.get(addr) or {}
@@ -147,7 +172,7 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
     except Exception:
         pass
 
-    # 4) Tabela utxos (usa get_utxos, thread-safe)
+    # 5) Tabela utxos (thread-safe)
     try:
         for u in CHAIN.db.get_utxos(addr):
             pk = (u.get("pubkey") or "").strip()
@@ -219,11 +244,7 @@ def portfolio(address):
 # ============================================================
 @app.route("/api/transacoes/<address>", methods=["GET"])
 def transacoes(address):
-    """
-    Lista txs onde o endereco aparece como OUTPUT (recebidas).
-    Versao robusta: try/except por bloco, para nao derrubar a rota
-    se um bloco especifico tiver dado corrompido.
-    """
+    """Lista txs onde o endereco aparece como OUTPUT. Robust por bloco."""
     try:
         txs = []
         altura = CHAIN.db.height()
@@ -251,14 +272,12 @@ def transacoes(address):
 @app.route("/api/minhas-txs/<address>", methods=["GET"])
 def minhas_txs(address):
     """
-    v8.6: Lista todas as txs que envolvem o endereco.
-    Inclui direcao (sent/received/self), status (pending/confirmed),
-    valor e confirmacoes. Cobre tanto blocos quanto mempool.
+    Lista todas as txs que envolvem o endereco (direcao, status, valor,
+    confirmacoes). Cobre tanto blocos quanto mempool.
     """
     try:
         altura = CHAIN.db.height()
 
-        # Coleta pubkeys associadas ao endereco (utxos atuais)
         try:
             meus_utxos = CHAIN.db.get_utxos(address)
         except Exception:
@@ -286,7 +305,6 @@ def minhas_txs(address):
                             is_mine_in = True
                             break
 
-                # Coinbase sem vinculo: se nao for output nosso, ignora
                 if not (is_mine_out or is_mine_in):
                     continue
 
@@ -313,7 +331,6 @@ def minhas_txs(address):
                     "timestamp": tx.get("timestamp", 0),
                 })
 
-        # Mempool: txs pendentes que envolvem o endereco
         try:
             mem = CHAIN.db.all_mempool(limit=500)
             for tx in mem:
@@ -441,7 +458,6 @@ def transfer():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# Aliases de compatibilidade com a carteira desktop
 @app.route("/api/send", methods=["POST"])
 @app.route("/api/enviar", methods=["POST"])
 def transfer_alias():
@@ -487,7 +503,7 @@ def mine():
 
 
 # ============================================================
-# v8.4: START/STOP DA MINERACAO (miner_loop singleton)
+# START/STOP DA MINERACAO (miner_loop singleton)
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @_rate_limit
@@ -538,7 +554,6 @@ def miner_stop():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# Aliases
 @app.route("/api/miner/on", methods=["POST"])
 @app.route("/api/start-mining", methods=["POST"])
 def miner_start_alias():
@@ -551,9 +566,6 @@ def miner_stop_alias():
     return miner_stop()
 
 
-# ============================================================
-# v8.3: MINER STATUS
-# ============================================================
 @app.route("/api/miner/status", methods=["GET"])
 def miner_status():
     try:
@@ -569,6 +581,9 @@ def miner_status():
             "last_height": st.get("last_height"),
             "uptime": st.get("uptime", 0),
             "consecutive_failures": st.get("consecutive_failures", 0),
+            "hashrate": st.get("hashrate", 0.0),
+            "hashes_done": st.get("hashes_done", 0),
+            "eta_seconds": st.get("eta_seconds"),
             "height": CHAIN.db.height(),
             "difficulty": CHAIN.current_difficulty(),
             "last_error": st.get("last_error", ""),
@@ -683,12 +698,7 @@ def hd_create():
         if strength not in (128, 160, 192, 224, 256):
             return jsonify({"ok": False, "msg": "strength invalido"}), 400
         result = HDWalletManager.create(strength=strength)
-        try:
-            wallets = carregar_wallets()
-            wallets[result["address"]] = {"public_key": result["public_key"]}
-            salvar_wallets(wallets)
-        except Exception:
-            pass
+        _registrar_pubkey(result["address"], result.get("public_key", ""))
         return jsonify({"ok": True, "warning": "GUARDE o mnemonico.", **result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -704,12 +714,7 @@ def hd_derive():
         if not HDWalletManager.validate_mnemonic(mn):
             return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
         result = HDWalletManager.from_mnemonic(mn, index=index)
-        try:
-            wallets = carregar_wallets()
-            wallets[result["address"]] = {"public_key": result["public_key"]}
-            salvar_wallets(wallets)
-        except Exception:
-            pass
+        _registrar_pubkey(result["address"], result.get("public_key", ""))
         return jsonify({"ok": True, **result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -729,7 +734,7 @@ def peers_score():
 
 
 # ============================================================
-# v8.3: SYNC INFO (usado pela carteira desktop)
+# SYNC INFO
 # ============================================================
 @app.route("/api/sync-info", methods=["GET"])
 def sync_info():
@@ -779,7 +784,7 @@ def sync_info():
 
 
 # ============================================================
-# v8.3: CONTRATOS INTELIGENTES
+# CONTRATOS INTELIGENTES
 # ============================================================
 @app.route("/api/contract/deploy", methods=["POST"])
 @_rate_limit
@@ -867,7 +872,7 @@ def contracts_list():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v8.6 - http://0.0.0.0:{port}")
+    print(f"BRN Server v8.7 - http://0.0.0.0:{port}")
 
     try:
         from miner_loop import iniciar_mineracao

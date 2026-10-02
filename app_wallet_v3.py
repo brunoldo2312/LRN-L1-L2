@@ -1,16 +1,21 @@
 """
-app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.4.2
+app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.4.3
 ============================================================
-API exposta ao JavaScript via ponte pywebview.
+v3.4.3:
+  - [CRÍTICO] generate_wallet() agora PERSISTE em current_wallet.json.
+    Antes, carteiras novas só existiam na memória do pywebview e o
+    backend não conseguia achar a pubkey ao iniciar mineração.
+  - load_wallet() também persiste em current_wallet.json.
+  - start_mining() envia 'miner_pubkey' E 'pubkey' + 'private_key'.
+  - _pubkey_no_db() usa get_utxos() (thread-safe) antes de conn.execute.
 
-v3.4.2: - start_mining() agora manda 'miner_pubkey' e 'private_key'
-          no payload (antes mandava 'validator_pubkey', que era ignorado).
-        - mine_block() idem: troca 'validator_pubkey' por 'miner_pubkey'.
-        - call_faucet() envia 'miner_pubkey'/'pubkey' além de 'public_key'.
-        - Assinaturas aceitam parâmetros opcionais sem quebrar compat.
+v3.4.2:
+  - start_mining() manda 'miner_pubkey' e 'private_key' no payload.
+  - mine_block() troca 'validator_pubkey' por 'miner_pubkey'.
+  - call_faucet() envia 'miner_pubkey'/'pubkey' além de 'public_key'.
 
-v3.4.1: timeouts aumentados (leitura=30, tx=20, mina=120).
-        Evita TIMEOUT quando o miner esta em 100% CPU.
+v3.4.1:
+  - timeouts aumentados (leitura=30, tx=120, mina=120).
 """
 import os
 import sys
@@ -35,7 +40,6 @@ EXPLORER_URL = os.environ.get("BRN_EXPLORER_URL", f"http://127.0.0.1:{EXPLORER_P
 WEB_USER = os.environ.get("BRN_WEB_USER", "admin")
 WEB_PASS = os.environ.get("BRN_WEB_PASS", "")
 
-# v3.4.1: timeouts maiores para sobreviver a mineracao
 TIMEOUT_LEITURA   = 30
 TIMEOUT_TX        = 120
 TIMEOUT_MINERACAO = 120
@@ -62,7 +66,8 @@ def _tratar_erro_http(r):
     if r.status_code == 400:
         try:
             data = r.json()
-            return {"ok": False, "msg": data.get("msg") or data.get("error", "Requisicao invalida.")}
+            return {"ok": False,
+                    "msg": data.get("msg") or data.get("error", "Requisicao invalida.")}
         except Exception:
             return {"ok": False, "msg": "Requisicao invalida (HTTP 400)."}
     if r.status_code == 401:
@@ -73,8 +78,17 @@ def _tratar_erro_http(r):
         return {"ok": False, "msg": "❓ Endpoint nao encontrado (HTTP 404)."}
     if r.status_code == 429:
         return {"ok": False, "msg": "⏳ Muitas requisicoes."}
+
     if r.status_code >= 500:
+        try:
+            data = r.json()
+            real = data.get("msg") or data.get("error")
+            if real:
+                return {"ok": False, "msg": f"💥 {real}"}
+        except Exception:
+            pass
         return {"ok": False, "msg": f"💥 Erro no servidor (HTTP {r.status_code})."}
+
     try:
         return r.json()
     except Exception:
@@ -105,9 +119,36 @@ class WalletApi:
     # ============================================================
     # CARTEIRA LOCAL
     # ============================================================
-    def generate_wallet(self):
+    def _persist_wallet(self, address, public_key, private_key=""):
+        """
+        v3.4.3: grava current_wallet.json para o backend conseguir
+        recuperar a pubkey mesmo sem payload explicito.
+        """
         try:
-            return WalletManager.generate_keypair()
+            p = Path(__file__).parent / CURRENT_WALLET_FILE
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({
+                    "address": address,
+                    "public_key": public_key,
+                    "private_key": private_key,
+                }, f, indent=2)
+            log.info(f"Carteira persistida em {p.name}: {address[:20]}...")
+            return True
+        except Exception as e:
+            log.warning(f"Falha ao persistir carteira: {e}")
+            return False
+
+    def generate_wallet(self):
+        """v3.4.3: persiste imediatamente para o backend encontrar a pubkey."""
+        try:
+            w = WalletManager.generate_keypair()
+            # Persiste no disco
+            self._persist_wallet(
+                w["address"],
+                w.get("public_key") or w.get("pubkey") or "",
+                w.get("private_key", ""),
+            )
+            return w
         except Exception as e:
             log.exception("generate_wallet falhou")
             return {"erro": str(e)}
@@ -119,7 +160,6 @@ class WalletApi:
             return False
 
     def get_active_wallet(self):
-        """Le current_wallet.json (gravado quando a carteira e gerada)."""
         try:
             p = Path(__file__).parent / CURRENT_WALLET_FILE
             if not p.exists():
@@ -134,19 +174,6 @@ class WalletApi:
             }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
-
-    def _save_current_wallet(self, address, public_key, private_key=""):
-        try:
-            p = Path(__file__).parent / CURRENT_WALLET_FILE
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump({
-                    "address": address,
-                    "public_key": public_key,
-                    "private_key": private_key,
-                }, f, indent=2)
-            return True
-        except Exception:
-            return False
 
     # ============================================================
     # LEITURA (nó)
@@ -186,7 +213,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def sync_info(self):
-        """Status de sincronizacao + peers (endpoint /api/sync-info)."""
         try:
             r = requests.get(f"{API_URL}/api/sync-info",
                              auth=AUTH, timeout=TIMEOUT_LEITURA)
@@ -254,6 +280,22 @@ class WalletApi:
         except Exception as e:
             return {"erro": str(e)}
 
+    def minhas_txs(self, addr):
+        if not self.validate_address(addr):
+            return {"ok": False, "msg": "Endereco invalido."}
+        try:
+            r = requests.get(f"{API_URL}/api/minhas-txs/{addr}",
+                             auth=AUTH, timeout=TIMEOUT_LEITURA)
+            if r.status_code != 200:
+                return _tratar_erro_http(r)
+            return r.json()
+        except requests.exceptions.ConnectionError:
+            return {"ok": False, "msg": "🔌 No offline."}
+        except requests.exceptions.Timeout:
+            return {"ok": False, "msg": "⏱️ Timeout."}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
     # ============================================================
     # TRANSACOES
     # ============================================================
@@ -296,17 +338,14 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def mine_block(self, addr, pk=""):
-        """
-        Minera UM bloco de forma sincrona (endpoint /api/mine).
-        Preferir start_mining() para mineracao continua.
-        """
+        """Minera UM bloco (sincrono). Preferir start_mining()."""
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
         try:
             payload = {"validator_address": addr}
             if pk:
-                # v3.4.2: era 'validator_pubkey' (ignorado pelo server).
                 payload["miner_pubkey"] = pk
+                payload["pubkey"] = pk
             r = requests.post(f"{API_URL}/api/mine", auth=AUTH,
                               json=payload, timeout=TIMEOUT_MINERACAO)
             if r.status_code == 200:
@@ -326,9 +365,6 @@ class WalletApi:
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
         try:
-            # v3.4.2: envia 'miner_pubkey' e 'pubkey' (o server procura por
-            # esses nomes). 'public_key' continua sendo mandado por
-            # compatibilidade, mas sozinho nao era suficiente.
             payload = {
                 "address": addr,
                 "miner_pubkey": pk,
@@ -352,18 +388,33 @@ class WalletApi:
     # ============================================================
     def start_mining(self, address, pubkey="", sk=""):
         """
-        Inicia mineracao continua (POST /api/miner/start).
-        v3.4.2: aceita pubkey E private_key e envia no payload.
-        O server usa (em ordem): miner_pubkey -> pubkey -> derivar da sk
-        -> user_wallets.json -> tabela utxos.
+        v3.4.3: se pubkey/sk vierem vazios do JS, tenta ler do
+        current_wallet.json (que foi persistido por generate_wallet
+        ou load_wallet).
         """
         if not self.validate_address(address):
             return {"ok": False, "msg": "Endereco invalido."}
+
+        # Fallback: ler do disco
+        if not pubkey or not sk:
+            try:
+                p = Path(__file__).parent / CURRENT_WALLET_FILE
+                if p.exists():
+                    with open(p, encoding="utf-8") as f:
+                        d = json.load(f)
+                    if d.get("address") == address:
+                        if not pubkey:
+                            pubkey = d.get("public_key") or d.get("pubkey") or ""
+                        if not sk:
+                            sk = d.get("private_key", "")
+            except Exception:
+                pass
+
         try:
             payload = {"validator_address": address}
             if pubkey:
                 payload["miner_pubkey"] = pubkey
-                payload["pubkey"] = pubkey          # alias
+                payload["pubkey"] = pubkey
             if sk:
                 payload["private_key"] = sk
             r = requests.post(f"{API_URL}/api/miner/start",
@@ -379,7 +430,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def stop_mining(self):
-        """Para a mineracao continua (POST /api/miner/stop)."""
         try:
             r = requests.post(f"{API_URL}/api/miner/stop",
                               auth=AUTH, timeout=TIMEOUT_LEITURA)
@@ -394,7 +444,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def mining_status(self):
-        """Retorna o status atual do miner (running, count, last_height, uptime)."""
         try:
             r = requests.get(f"{API_URL}/api/miner/status",
                              auth=AUTH, timeout=TIMEOUT_LEITURA)
@@ -425,22 +474,6 @@ class WalletApi:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def minhas_txs(self, addr):
-        if not self.validate_address(addr):
-            return {"ok": False, "msg": "Endereco invalido."}
-        try:
-            r = requests.get(f"{API_URL}/api/minhas-txs/{addr}",
-                             auth=AUTH, timeout=TIMEOUT_LEITURA)
-            if r.status_code != 200:
-                return _tratar_erro_http(r)
-            return r.json()
-        except requests.exceptions.ConnectionError:
-            return {"ok": False, "msg": "🔌 No offline."}
-        except requests.exceptions.Timeout:
-            return {"ok": False, "msg": "⏱️ Timeout."}
-        except Exception as e:
-            return {"ok": False, "msg": str(e)}
-
     def verificar_recebimento(self, addr, txid_str):
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
@@ -459,7 +492,7 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     # ============================================================
-    # BRIDGE (stub - nao existe no v8)
+    # BRIDGE (stub)
     # ============================================================
     def bridge_claim(self, txid, addr):
         return {"ok": False, "msg": "Bridge nao disponivel nesta versao"}
@@ -474,8 +507,16 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def load_wallet(self, filename, password):
+        """v3.4.3: também persiste em current_wallet.json."""
         try:
-            return WalletManager.load_encrypted_wallet(filename, password)
+            r = WalletManager.load_encrypted_wallet(filename, password)
+            if r.get("ok"):
+                self._persist_wallet(
+                    r.get("address", ""),
+                    r.get("public_key", ""),
+                    r.get("private_key", ""),
+                )
+            return r
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -499,7 +540,7 @@ def main():
     api = WalletApi()
 
     log.info("=" * 60)
-    log.info("  🚀 BRN Wallet v3.4.2")
+    log.info("  🚀 BRN Wallet v3.4.3")
     log.info(f"  API_URL      : {API_URL}")
     log.info(f"  EXPLORER_URL : {EXPLORER_URL}")
     log.info(f"  HTML         : {index_path.name}")
