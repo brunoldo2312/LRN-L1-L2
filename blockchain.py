@@ -1,22 +1,30 @@
 ﻿"""
-blockchain.py â€” NÃºcleo da Blockchain BRN
-VersÃ£o: 6.0 | Data: 29/09/2026
+blockchain.py — Núcleo da Blockchain BRN
+Versão: 8.1 | Data: 02/10/2026
 
-Changelog v6.0 (breaking):
-- [CRÃTICO] make_coinbase/build_genesis exigem pubkey na saÃ­da.
-            Sem pubkey, o UTXO Ã© NÃƒO-GASTÃVEL (validate_tx rejeita).
-- [CRÃTICO] validate_tx exige correspondÃªncia EXATA entre input.pubkey
-            e utxo.pubkey â€” sem curto-circuito em pubkey vazia.
-- [CRÃTICO] txid() e signing_hash() agora derivam do MESMO _tx_core().
-            Isso elimina malleabilidade da pubkey no input.
-- [MELHORIA] signing_hash prefixa b"BRN-TX-v1|" (domain separation).
-            Evita reuso de assinatura em outros contextos (P2P, API).
-- [MELHORIA] versÃ£o explÃ­cita (_CORE_V) na serializaÃ§Ã£o.
-- [API] mine_block e mine_block_interruptible exigem miner_pubkey.
+Changelog v8.1:
+- [CRÍTICO] current_difficulty() agora respeita MAX_DIFFICULTY=5.
+             Cadeias com difficulty>MAX sao rebaixadas no proximo calculo.
+             Corrige minerador travado por dificuldade 16 (impossivel em CPU).
 
-v5.1: + confirmaÃ§Ãµes de transaÃ§Ã£o
-v5:   + nonce (proteÃ§Ã£o replay) em signing_hash, txid e validate_tx
-v4:   + cumulative_work, + reorg_to, + estimate_fee
+v8.0:
+- [NOVO] Suporte a contratos inteligentes (JSON declarativo)
+- [NOVO] _validate_contract_tx() — valida tx de contrato na mempool
+- [NOVO] _apply_contract_tx()   — executa contrato ao minerar bloco
+- [NOVO] validate_tx() chama validação de contrato quando data.type existe
+- [NOVO] accept_block() executa contratos após aplicar as txs
+
+v7.0:
+- [CRÍTICO] auto_genesis: cliente (B) NÃO cria gênesis — espera da rede.
+- [CRÍTICO] validate_block valida gênesis do cliente contra hash esperado.
+- [CRÍTICO] Removido fallback "00"*33 em make_coinbase/mine_block.
+- [CRÍTICO] data entra no _tx_core (necessário para contrato de genes).
+
+v6.0 (breaking):
+- make_coinbase/build_genesis exigem pubkey na saída.
+- validate_tx exige correspondência EXATA entre input.pubkey e utxo.pubkey.
+- txid() e signing_hash() derivam do MESMO _tx_core().
+- signing_hash prefixa b"BRN-TX-v1|" (domain separation).
 """
 
 import time
@@ -33,7 +41,8 @@ INITIAL_REWARD = 50 * UNIT
 HALVING_INTERVAL = 210_000
 BLOCK_TIME = 120
 DIFFICULTY_INTERVAL = 2016
-INITIAL_DIFFICULTY = 4
+INITIAL_DIFFICULTY = 3
+MAX_DIFFICULTY = 5
 MAX_TX_PER_BLOCK = 500
 MIN_RELAY_FEE = 1000
 MAX_REORG_DEPTH = 100
@@ -44,20 +53,13 @@ GENESIS_REWARD = INITIAL_REWARD
 GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
 
 # v6: pubkey correspondente ao GENESIS_ADDRESS.
-# Se ficar vazia, a UTXO do gÃªnese Ã© inerentemente NÃƒO-GASTÃVEL
-# (o validador exige correspondÃªncia exata entre input.pubkey e utxo.pubkey).
-# Defina aqui se quiser gastar as moedas do gÃªnese.
+# Se ficar vazia, a UTXO do gênesis é NÃO-GASTÁVEL.
 GENESIS_PUBKEY = ""
 
 # ============================================================
 # v6: DOMAIN SEPARATION
 # ============================================================
-# Prefixo aplicado ao signing_hash. Impede que uma assinatura feita
-# para um contexto (ex.: handshake P2P, autenticaÃ§Ã£o de API) seja
-# reutilizada como assinatura de transaÃ§Ã£o, e vice-versa.
 SIGNING_DOMAIN = b"BRN-TX-v1|"
-
-# v6: versÃ£o do layout serializado. Incrementar SEMPRE que _tx_core mudar.
 _CORE_V = 1
 
 
@@ -93,18 +95,14 @@ def compute_merkle_root(txids):
 
 
 # ============================================================
-# v6: SERIALIZAÃ‡ÃƒO CANÃ”NICA
+# v6/v7/v8: SERIALIZAÇÃO CANÔNICA
 # ============================================================
 def _tx_core(tx):
     """
-    NÃºcleo canÃ´nico. TUDO que importa para identidade e autoria
-    passa por aqui â€” txid() e signing_hash() usam este mesmo core.
+    Núcleo canônico. TUDO que importa para identidade e autoria
+    passa por aqui — txid() e signing_hash() usam este mesmo core.
 
-    Regras:
-      - chaves ordenadas (OPT_SORT_KEYS)
-      - pubkey presente em inputs E outputs
-      - height entra sÃ³ se existir (coinbase)
-      - versÃ£o explÃ­cita (_CORE_V)
+    v7: inclui "data" (usado pelo contrato de genes e contratos inteligentes).
     """
     inputs = [
         {
@@ -130,6 +128,9 @@ def _tx_core(tx):
         "locktime": tx.get("locktime", 0),
         "nonce": tx.get("nonce", 0),
     }
+    # v7: data é assinado (necessário para o contrato de genes)
+    if "data" in tx and tx["data"] is not None:
+        core["data"] = tx["data"]
     if "height" in tx:
         core["height"] = tx["height"]
     return core
@@ -140,28 +141,27 @@ def _serialize_core(tx):
 
 
 def txid(tx):
-    """Identidade da tx. Derivada do mesmo core que Ã© assinado."""
+    """Identidade da tx. Derivada do mesmo core que é assinado."""
     return double_sha256(_serialize_core(tx)).hex()
 
 
 def signing_hash(tx):
-    """
-    Hash efetivamente assinado.
-    Prefixado com SIGNING_DOMAIN para evitar cross-protocol replay.
-    """
+    """Hash efetivamente assinado, com domain separation."""
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
 # ============================================================
-# v6: COINBASE E GÃŠNESE â€” pubkey obrigatÃ³ria
+# v6/v7: COINBASE E GÊNESE
 # ============================================================
 def make_coinbase(address, pubkey_hex, height, reward):
     """
     Cria uma coinbase.
-    pubkey_hex Ã© OBRIGATÃ“RIA: sem ela o UTXO Ã© nÃ£o-gastÃ¡vel.
+    v7: pubkey_hex é OBRIGATÓRIA — sem fallback.
     """
     if not pubkey_hex:
-         pubkey_hex = "00" * 33
+        raise ValueError(
+            "make_coinbase: pubkey_hex é obrigatória (sem fallback '00'*33)"
+        )
     cb = {
         "txid": "",
         "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
@@ -210,8 +210,21 @@ GENESIS_BLOCK = build_genesis()
 # ============================================================
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db",
-                 genesis_address=None, genesis_pubkey=None):
+                 genesis_address=None, genesis_pubkey=None,
+                 auto_genesis=True):
+        """
+        auto_genesis=True  (Programa A): cria gênesis local se DB vazio.
+        auto_genesis=False (Programa B): DB vazio, espera vir da rede.
+        """
         self.db = ChainDB(db_path)
+        self.genesis_expected_hash = None
+
+        if not auto_genesis:
+            # v7: modo cliente — guarda hash esperado para validar gênesis
+            self.genesis_expected_hash = GENESIS_BLOCK["hash"]
+            # NÃO cria gênesis local. Deixa o DB vazio.
+            return
+
         if self.db.height() < 0:
             g = GENESIS_BLOCK
             if genesis_address:
@@ -258,19 +271,37 @@ class Blockchain:
         return INITIAL_REWARD >> halvings
 
     def current_difficulty(self):
+        """
+        v8.1: respeita MAX_DIFFICULTY.
+
+        Fluxo:
+          - h < DIFFICULTY_INTERVAL: retorna INITIAL_DIFFICULTY (3).
+          - Caso contrário, recalcula com base no tempo real do último
+            intervalo, e aplica clamp em [1, MAX_DIFFICULTY].
+          - Se a cadeia foi corrompida por versões antigas (ex: difficulty=16),
+            o retorno imediato é MAX_DIFFICULTY para destravar o minerador.
+        """
         h = self.db.height()
         if h < DIFFICULTY_INTERVAL:
             return INITIAL_DIFFICULTY
+
         start = self.db.get_block(h - DIFFICULTY_INTERVAL + 1)
         end = self.db.get_block(h)
         if not start or not end:
             return INITIAL_DIFFICULTY
+
+        # v8.1: se a dificuldade atual já passou do teto, rebaixa já.
+        if end["difficulty"] > MAX_DIFFICULTY:
+            return MAX_DIFFICULTY
+
         actual = max(1, end["timestamp"] - start["timestamp"])
         expected = BLOCK_TIME * DIFFICULTY_INTERVAL
         prev = end["difficulty"]
         new = int(prev * expected / actual)
         new = max(prev // 4, min(prev * 4, new))
-        return max(1, new)
+        # v8.1: clamp final ao teto.
+        new = max(1, min(MAX_DIFFICULTY, new))
+        return new
 
     def cumulative_work(self):
         total = 0
@@ -313,38 +344,110 @@ class Blockchain:
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
     # --------------------------------------------------------
-    # v6: VALIDAÃ‡ÃƒO DE TRANSAÃ‡ÃƒO
+    # v8: VALIDAÇÃO DE CONTRATO (na mempool)
+    # --------------------------------------------------------
+    def _validate_contract_tx(self, tx):
+        """
+        Valida tx de contrato SEM executar (execução acontece em accept_block).
+        Retorna (ok, msg).
+        """
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+
+        if t == "deploy":
+            code = tx_data.get("code")
+            if not isinstance(code, dict):
+                return False, "deploy sem 'code' (dict)"
+            try:
+                from contracts import ContractVM
+                return ContractVM.validate(code)
+            except ImportError:
+                return False, "modulo contracts.py nao encontrado"
+            except Exception as e:
+                return False, f"erro validando contrato: {e}"
+
+        if t == "call":
+            cid = tx_data.get("contract_id")
+            if not cid or not isinstance(cid, str):
+                return False, "call sem 'contract_id'"
+            if not cid.startswith("ctr1"):
+                return False, "contract_id deve começar com 'ctr1'"
+            if not self.db.contract_get(cid):
+                return False, f"contrato {cid[:16]}... nao existe"
+            return True, "ok"
+
+        return False, f"tipo de contrato desconhecido: {t}"
+
+    # --------------------------------------------------------
+    # v8: EXECUÇÃO DE CONTRATO (ao minerar bloco)
+    # --------------------------------------------------------
+    def _apply_contract_tx(self, tx):
+        """
+        Executa o contrato quando a tx é aplicada (dentro de accept_block).
+        Retorna dict com resultado. Levanta ValueError em caso de falha.
+        """
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+
+        from contracts import deploy as _deploy, call as _call
+
+        if t == "deploy":
+            owner = ""
+            if tx.get("outputs"):
+                owner = tx["outputs"][0].get("address", "") or ""
+            r = _deploy(self, owner, tx_data.get("code") or {},
+                        metadata=tx_data.get("metadata"))
+            if not r.get("ok"):
+                raise ValueError(f"deploy falhou: {r.get('msg')}")
+            return r
+
+        if t == "call":
+            caller = ""
+            if tx.get("outputs"):
+                caller = tx["outputs"][0].get("address", "") or ""
+            r = _call(self, tx_data.get("contract_id", ""),
+                      caller, tx_data.get("args"))
+            if not r.get("ok"):
+                raise ValueError(f"call falhou: {r.get('msg')}")
+            return r
+
+        raise ValueError(f"tipo de contrato desconhecido: {t}")
+
+    # --------------------------------------------------------
+    # VALIDAÇÃO DE TRANSAÇÃO
     # --------------------------------------------------------
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
 
-        # 1) estrutura bÃ¡sica
         if not tx.get("inputs") or not tx.get("outputs"):
             return False, "tx sem inputs/outputs"
         if tx["inputs"][0]["txid"] == "0" * 64:
             return False, "coinbase invalida"
 
-        # 2) txid canÃ´nico
         if tx.get("txid") != txid(tx):
             return False, "txid invalido"
 
-        # 3) todo input exige pubkey
+        # v8: valida contrato se data.type existir
+        tx_data = tx.get("data") or {}
+        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
+            ok_ctr, msg_ctr = self._validate_contract_tx(tx)
+            if not ok_ctr:
+                return False, f"contrato: {msg_ctr}"
+
         for inp in tx["inputs"]:
             if not inp.get("pubkey"):
                 return False, "input sem pubkey"
 
-        # 4) nonce por pubkey (replay protection)
         tx_nonce = tx.get("nonce", 0)
         for inp in tx["inputs"]:
             pk = inp["pubkey"]
             expected = self.db.get_nonce_for_pubkey(pk)
             if tx_nonce != expected:
                 return False, (
-                    f"nonce invalido para {pk[:16]}â€¦ "
+                    f"nonce invalido para {pk[:16]}... "
                     f"(esperado {expected}, recebido {tx_nonce})"
                 )
 
-        # 5) UTXOs + binding pubkeyâ†”UTXO
         in_sum = 0
         seen = set()
         for inp in tx["inputs"]:
@@ -357,22 +460,19 @@ class Blockchain:
             if not u:
                 return False, "UTXO inexistente"
 
-            # v6: SEMPRE exige correspondÃªncia exata â€” sem curto-circuito
             if inp["pubkey"] != u["pubkey"]:
                 return False, (
-                    f"pubkey mismatch: input={inp['pubkey'][:16]}â€¦ "
+                    f"pubkey mismatch: input={inp['pubkey'][:16]}... "
                     f"utxo={u['pubkey'][:16] if u['pubkey'] else '(vazio)'}"
                 )
             in_sum += u["amount"]
 
-        # 6) somas e fee
         out_sum = sum(o["amount"] for o in tx["outputs"])
         if out_sum > in_sum:
             return False, "outputs > inputs"
         if in_sum - out_sum < MIN_RELAY_FEE:
             return False, "fee abaixo do minimo"
 
-        # 7) assinatura (com domain separation)
         sig_hash = signing_hash(tx)
         for inp in tx["inputs"]:
             if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
@@ -394,9 +494,18 @@ class Blockchain:
         return True, tx["txid"]
 
     # --------------------------------------------------------
-    # v6: VALIDAÃ‡ÃƒO DE BLOCO
+    # VALIDAÇÃO DE BLOCO
     # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
+        # v7: modo cliente — valida gênesis contra hash hardcoded
+        if block["height"] == 0 and prev_block is None:
+            if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
+                return False, (
+                    f"genesis nao corresponde ao esperado\n"
+                    f"  esperado: {self.genesis_expected_hash[:16]}...\n"
+                    f"  recebido: {block['hash'][:16]}..."
+                )
+
         if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
             return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
@@ -411,17 +520,14 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
-        # coinbase
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
         if cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
-        # v6: toda saÃ­da da coinbase precisa de pubkey
         for out in cb["outputs"]:
             if not out.get("pubkey"):
                 return False, "coinbase output sem pubkey"
-        # v6: coinbase nÃ£o deve ter assinatura no input
         for inp in cb["inputs"]:
             if inp.get("signature"):
                 return False, "coinbase input com assinatura"
@@ -441,20 +547,38 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
+    # --------------------------------------------------------
+    # ACEITAÇÃO DE BLOCO (com contratos)
+    # --------------------------------------------------------
     def accept_block(self, block):
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev)
         if not ok:
             return False, msg
+
         self.db.add_block(block)
+
         for i, t in enumerate(block["transactions"]):
-            self.db.apply_tx(t, block["height"], coinbase=(i == 0))
+            coinbase = (i == 0)
+            self.db.apply_tx(t, block["height"], coinbase=coinbase)
             if i > 0:
                 self.db.remove_mempool(t["txid"])
+
+            # v8: executa contrato se a tx tem data.type
+            if not coinbase:
+                tx_data = t.get("data") or {}
+                if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
+                    try:
+                        self._apply_contract_tx(t)
+                    except Exception as e:
+                        # Contrato falhou: loga mas NÃO reverte o bloco
+                        # (o bloco já foi aceito pela rede; o estado fica consistente)
+                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
+
         return True, block["hash"]
 
     # --------------------------------------------------------
-    # REORG (inalterado)
+    # REORG
     # --------------------------------------------------------
     def reorg_to(self, new_blocks):
         if not new_blocks:
@@ -513,11 +637,13 @@ class Blockchain:
         return True, f"reorg ok ({len(blocks_to_add)} blocos)"
 
     # --------------------------------------------------------
-    # v6: MINERAÃ‡ÃƒO â€” exige miner_pubkey
+    # MINERAÇÃO
     # --------------------------------------------------------
-    def mine_block(self, miner_address, miner_pubkey=""):
+    def mine_block(self, miner_address, miner_pubkey):
         if not miner_pubkey:
-            miner_pubkey = "00" * 33
+            raise ValueError(
+                "mine_block: miner_pubkey é obrigatória (sem fallback '00'*33)"
+            )
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -541,9 +667,11 @@ class Blockchain:
         ok, msg = self.accept_block(block)
         return block if ok else None
 
-    def mine_block_interruptible(self, miner_address, miner_pubkey="", should_continue=None):
+    def mine_block_interruptible(self, miner_address, miner_pubkey, should_continue=None):
         if not miner_pubkey:
-            miner_pubkey = "00" * 33
+            raise ValueError(
+                "mine_block_interruptible: miner_pubkey é obrigatória"
+            )
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -570,7 +698,7 @@ class Blockchain:
         return block if ok else None
 
     # --------------------------------------------------------
-    # CONFIRMAÃ‡Ã•ES (inalterado)
+    # CONFIRMAÇÕES
     # --------------------------------------------------------
     def get_latest_height(self) -> int:
         return self.db.height()
@@ -587,7 +715,7 @@ class Blockchain:
 
 
 # ------------------------------------------------------------
-# Plug do chain_validator (inalterado)
+# Plug do chain_validator
 # ------------------------------------------------------------
 try:
     from chain_validator import verify_chain as _verify_ext
@@ -600,4 +728,3 @@ try:
     print("chain_validator.py plugado em Blockchain")
 except ImportError:
     print("chain_validator.py nao encontrado")
-

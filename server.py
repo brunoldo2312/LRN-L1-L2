@@ -1,4 +1,14 @@
-"""server.py — Backend HTTP do no BRN (v8 - sem bridge)"""
+"""server.py — Backend HTTP do no BRN (v8.5)
+v8.5: _pubkey_from_db_or_payload agora consulta user_wallets.json,
+      aceita private_key no payload para derivar pubkey, e registra
+      no user_wallets.json quando descobre a pubkey.
+v8.4: + /api/miner/start e /api/miner/stop (miner_loop singleton)
+      + aliases /api/miner/on, /api/start-mining, /api/send, /api/enviar
+v8.3: + endpoints de contratos inteligentes (/api/contract/*)
+      + /api/sync-info (usado pela carteira desktop)
+      + /api/miner/status
+v8.0: - removida bridge (nao usada)
+"""
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
@@ -16,6 +26,9 @@ CORS(app)
 CHAIN = Blockchain("brn_v2_chain.db")
 WALLETS_FILE = "user_wallets.json"
 
+# ============================================================
+# CONFIG
+# ============================================================
 FAUCET_AMOUNT_BRN = 10
 FAUCET_MAX_PER_ADDRESS = 3
 FAUCET_COOLDOWN_S = 60 * 60
@@ -31,6 +44,9 @@ _cache_lock = threading.Lock()
 CACHE_TTL_S = 5
 
 
+# ============================================================
+# RATE LIMIT
+# ============================================================
 def _rate_limit(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -47,6 +63,9 @@ def _rate_limit(f):
     return wrapper
 
 
+# ============================================================
+# CACHE DE SALDO
+# ============================================================
 def _saldo_cache_get(addr):
     with _cache_lock:
         if addr in _cache_saldos:
@@ -66,6 +85,9 @@ def _saldo_cache_invalidate(addr):
         _cache_saldos.pop(addr, None)
 
 
+# ============================================================
+# WALLETS EM JSON
+# ============================================================
 def carregar_wallets():
     if not os.path.exists(WALLETS_FILE):
         return {}
@@ -79,6 +101,68 @@ def carregar_wallets():
 def salvar_wallets(w):
     with open(WALLETS_FILE, "w") as f:
         json.dump(w, f, indent=2)
+
+
+# ============================================================
+# v8.5: RESOLUCAO DA PUBKEY (3 fontes + derivacao)
+# ============================================================
+def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
+                               payload_sk: str = "") -> str:
+    """
+    Retorna a pubkey do endereco. Ordem de prioridade:
+
+      1. payload_pubkey (o frontend manda explicitamente)
+      2. payload_sk   -> deriva a pubkey e confere o endereco
+      3. user_wallets.json (salvo por /api/nova-carteira)
+      4. tabela utxos (so existe se o endereco ja recebeu algo)
+
+    Se descobrir a pubkey por (2) e o endereco ainda nao estiver
+    em user_wallets.json, registra para chamadas futuras.
+    """
+    # 1) Payload explicito
+    if payload_pubkey:
+        return payload_pubkey.strip()
+
+    # 2) Derivar a partir da private key, se veio
+    if payload_sk:
+        try:
+            _w = Wallet(private_key_hex=payload_sk.strip())
+            if _w.address == addr:
+                pk = _w.pub_hex
+                # Aproveita pra persistir no user_wallets.json
+                try:
+                    wallets = carregar_wallets()
+                    if wallets.get(addr, {}).get("public_key") != pk:
+                        wallets[addr] = {"public_key": pk}
+                        salvar_wallets(wallets)
+                except Exception:
+                    pass
+                return pk
+        except Exception:
+            pass
+
+    # 3) user_wallets.json
+    try:
+        wallets = carregar_wallets()
+        entry = wallets.get(addr) or {}
+        pk = (entry.get("public_key") or entry.get("pubkey") or "").strip()
+        if pk:
+            return pk
+    except Exception:
+        pass
+
+    # 4) Tabela utxos
+    try:
+        row = CHAIN.db.conn.execute(
+            "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
+            (addr,)
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+
+    return ""
 
 
 # ============================================================
@@ -96,6 +180,9 @@ def nova_carteira():
             "public_key": w.pub_hex,
             "warning": "Guarde a chave privada."
         }
+        # Persiste a pubkey vinculada ao endereco.
+        # Isso permite que /api/miner/start e /api/faucet achem a pubkey
+        # sem precisar esperar uma tx.
         wallets = carregar_wallets()
         wallets[w.address] = {"public_key": w.pub_hex}
         salvar_wallets(wallets)
@@ -238,29 +325,139 @@ def transfer():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# Aliases de compatibilidade com a carteira desktop
+@app.route("/api/send", methods=["POST"])
+@app.route("/api/enviar", methods=["POST"])
+def transfer_alias():
+    return transfer()
+
+
 # ============================================================
-# MINERACAO
+# MINERACAO (uma vez, sob demanda)
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
 @_rate_limit
 def mine():
     try:
         data = request.get_json(force=True) or {}
-        miner = data.get("validator_address", "").strip()
+        miner = (data.get("validator_address")
+                 or data.get("address")
+                 or "").strip()
         if not WalletManager.validate_address(miner):
             return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-        block = CHAIN.mine_block(miner)
+
+        miner_pubkey = _pubkey_from_db_or_payload(
+            miner,
+            data.get("miner_pubkey", "") or data.get("pubkey", ""),
+            data.get("private_key", "") or data.get("privatekey", ""),
+        )
+        if not miner_pubkey:
+            return jsonify({"ok": False,
+                            "msg": "Pubkey do minerador desconhecida. "
+                                   "Receba uma tx antes ou passe 'miner_pubkey'."}), 400
+
+        block = CHAIN.mine_block(miner, miner_pubkey)
         if not block:
-            return jsonify({"ok": False, "msg": "Falha."}), 500
+            return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
         _saldo_cache_invalidate(miner)
         return jsonify({"ok": True,
-                        "msg": "Bloco minerado!",
+                        "msg": f"Bloco #{block['height']} minerado!",
                         "block": {"height": block["height"], "hash": block["hash"],
                                   "txs": len(block["transactions"]),
                                   "difficulty": block["difficulty"],
                                   "nonce": block["nonce"]}})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# ============================================================
+# v8.4: START/STOP DA MINERACAO (miner_loop singleton)
+# ============================================================
+@app.route("/api/miner/start", methods=["POST"])
+@_rate_limit
+def miner_start():
+    try:
+        data = request.get_json(force=True) or {}
+        addr = (data.get("validator_address")
+                or data.get("address")
+                or "").strip()
+        pubkey_payload = (data.get("miner_pubkey")
+                          or data.get("pubkey")
+                          or data.get("public_key")
+                          or "").strip()
+        sk_payload = (data.get("private_key")
+                      or data.get("privatekey")
+                      or "").strip()
+
+        if not WalletManager.validate_address(addr):
+            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+
+        pubkey = _pubkey_from_db_or_payload(addr, pubkey_payload, sk_payload)
+        if not pubkey:
+            return jsonify({
+                "ok": False,
+                "msg": "Pubkey desconhecida. Receba uma tx antes "
+                       "ou passe 'miner_pubkey'."
+            }), 400
+
+        from miner_loop import get_miner
+        m = get_miner(CHAIN)
+        ok, msg = m.start(addr, pubkey)
+        if not ok:
+            return jsonify({"ok": False, "msg": msg, **m.status()}), 400
+        return jsonify({"ok": True, "msg": "Minerador iniciado.", **m.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/miner/stop", methods=["POST"])
+@_rate_limit
+def miner_stop():
+    try:
+        from miner_loop import get_miner
+        m = get_miner(CHAIN)
+        ok, msg = m.stop()
+        return jsonify({"ok": ok, "msg": msg, **m.status()})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+# Aliases (variantes que algumas versoes da UI usam)
+@app.route("/api/miner/on", methods=["POST"])
+@app.route("/api/start-mining", methods=["POST"])
+def miner_start_alias():
+    return miner_start()
+
+
+@app.route("/api/miner/off", methods=["POST"])
+@app.route("/api/stop-mining", methods=["POST"])
+def miner_stop_alias():
+    return miner_stop()
+
+
+# ============================================================
+# v8.3: MINER STATUS
+# ============================================================
+@app.route("/api/miner/status", methods=["GET"])
+def miner_status():
+    try:
+        from miner_loop import get_miner
+        m = get_miner(CHAIN)
+        st = m.status()
+        return jsonify({
+            "running": st.get("running", False),
+            "address": st.get("address", ""),
+            "pubkey": st.get("pubkey", ""),
+            "blocks_mined": st.get("blocks_mined", 0),
+            "count": st.get("count", st.get("blocks_mined", 0)),
+            "last_height": st.get("last_height"),
+            "uptime": st.get("uptime", 0),
+            "height": CHAIN.db.height(),
+            "difficulty": CHAIN.current_difficulty(),
+            "last_error": st.get("last_error", ""),
+        })
+    except Exception as e:
+        return jsonify({"running": False, "error": str(e)}), 200
 
 
 # ============================================================
@@ -271,7 +468,7 @@ def mine():
 def faucet():
     try:
         data = request.get_json(force=True) or {}
-        addr = data.get("address", "").strip()
+        addr = (data.get("address") or data.get("validator_address") or "").strip()
         if not WalletManager.validate_address(addr):
             return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
 
@@ -279,14 +476,28 @@ def faucet():
         hist = _faucet_history.setdefault(addr, [])
         hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
         if len(hist) >= FAUCET_MAX_PER_ADDRESS:
-            return jsonify({"ok": False, "msg": "Limite."}), 429
+            return jsonify({"ok": False, "msg": "Limite atingido."}), 429
+        if hist and agora - hist[-1] < FAUCET_COOLDOWN_S:
+            falta = int(FAUCET_COOLDOWN_S - (agora - hist[-1]))
+            return jsonify({"ok": False, "msg": f"Aguarde {falta}s."}), 429
 
-        block = CHAIN.mine_block(addr)
+        miner_pubkey = _pubkey_from_db_or_payload(
+            addr,
+            data.get("miner_pubkey", "") or data.get("pubkey", ""),
+            data.get("private_key", "") or data.get("privatekey", ""),
+        )
+        if not miner_pubkey:
+            return jsonify({"ok": False,
+                            "msg": "Pubkey desconhecida. Receba uma tx primeiro."}), 400
+
+        block = CHAIN.mine_block(addr, miner_pubkey)
         if not block:
-            return jsonify({"ok": False, "msg": "Falha."}), 500
+            return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
         hist.append(agora)
         _saldo_cache_invalidate(addr)
-        return jsonify({"ok": True, "msg": "Faucet enviado.",
+        return jsonify({"ok": True,
+                        "msg": f"Faucet enviado! +{FAUCET_AMOUNT_BRN} BRN",
+                        "txid": block["transactions"][0]["txid"],
                         "amount": FAUCET_AMOUNT_BRN})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -315,9 +526,13 @@ def status():
         "peers": CHAIN.db.contar_peers(apenas_ativos=True),
         "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
         "difficulty": CHAIN.current_difficulty(),
+        "contracts": CHAIN.db.contract_count() if hasattr(CHAIN.db, "contract_count") else 0,
     })
 
 
+# ============================================================
+# FEE / WORK / NONCE
+# ============================================================
 @app.route("/api/fee-estimate", methods=["GET"])
 def fee_estimate():
     return jsonify({"success": True,
@@ -333,6 +548,15 @@ def work():
                     "cumulative_work": CHAIN.cumulative_work()})
 
 
+@app.route("/api/nonce/<pubkey>", methods=["GET"])
+def get_nonce(pubkey):
+    return jsonify({"success": True, "pubkey": pubkey,
+                    "next_nonce": CHAIN.db.get_nonce_for_pubkey(pubkey)})
+
+
+# ============================================================
+# HD WALLET
+# ============================================================
 @app.route("/api/hd/create", methods=["POST"])
 @_rate_limit
 def hd_create():
@@ -342,6 +566,13 @@ def hd_create():
         if strength not in (128, 160, 192, 224, 256):
             return jsonify({"ok": False, "msg": "strength invalido"}), 400
         result = HDWalletManager.create(strength=strength)
+        # Registra a pubkey do index 0 no user_wallets.json
+        try:
+            wallets = carregar_wallets()
+            wallets[result["address"]] = {"public_key": result["public_key"]}
+            salvar_wallets(wallets)
+        except Exception:
+            pass
         return jsonify({"ok": True, "warning": "GUARDE o mnemonico.", **result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -356,11 +587,21 @@ def hd_derive():
         index = int(data.get("index", 0))
         if not HDWalletManager.validate_mnemonic(mn):
             return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
-        return jsonify({"ok": True, **HDWalletManager.from_mnemonic(mn, index=index)})
+        result = HDWalletManager.from_mnemonic(mn, index=index)
+        try:
+            wallets = carregar_wallets()
+            wallets[result["address"]] = {"public_key": result["public_key"]}
+            salvar_wallets(wallets)
+        except Exception:
+            pass
+        return jsonify({"ok": True, **result})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
+# ============================================================
+# PEERS
+# ============================================================
 @app.route("/api/peers/score", methods=["GET"])
 def peers_score():
     try:
@@ -371,13 +612,138 @@ def peers_score():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/api/nonce/<pubkey>", methods=["GET"])
-def get_nonce(pubkey):
+# ============================================================
+# v8.3: SYNC INFO (usado pela carteira desktop)
+# ============================================================
+@app.route("/api/sync-info", methods=["GET"])
+def sync_info():
     try:
-        return jsonify({"success": True, "pubkey": pubkey,
-                        "next_nonce": CHAIN.db.get_nonce_for_pubkey(pubkey)})
+        peers = CHAIN.db.contar_peers(apenas_ativos=True)
+        local_h = CHAIN.db.height()
+        local_work = CHAIN.cumulative_work()
+
+        target_h = local_h
+        try:
+            todos = CHAIN.db.listar_peers(apenas_ativos=False)
+            if todos:
+                heights = [p.get("height") or 0 for p in todos]
+                if heights:
+                    target_h = max(target_h, max(heights))
+        except Exception:
+            pass
+
+        if target_h <= 0:
+            percent = 100.0
+        else:
+            percent = min(100.0, round(local_h / target_h * 100, 2))
+
+        return jsonify({
+            "ok": True,
+            "sync": {
+                "percent": percent,
+                "height": local_h,
+                "target": target_h,
+                "peers": peers,
+                "work": local_work,
+            },
+            "miner_target": CHAIN.db.get_meta("miner_address") or "",
+            "bridge": {
+                "onramp_ativo": False,
+                "offramp_ativo": False,
+                "taxa": 0,
+                "btc_cofre": "",
+            },
+            "bridge_onramp": {
+                "processados": 0,
+                "ultima_sync": None,
+            },
+        })
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
+
+# ============================================================
+# v8.3: CONTRATOS INTELIGENTES
+# ============================================================
+@app.route("/api/contract/deploy", methods=["POST"])
+@_rate_limit
+def contract_deploy():
+    try:
+        data = request.get_json(force=True) or {}
+        owner = (data.get("owner") or "").strip()
+        code = data.get("code")
+        metadata = data.get("metadata")
+
+        if not WalletManager.validate_address(owner):
+            return jsonify({"ok": False, "msg": "owner invalido"}), 400
+        if not isinstance(code, dict):
+            return jsonify({"ok": False, "msg": "code deve ser dict"}), 400
+
+        try:
+            from contracts import ContractVM, deploy
+        except ImportError as e:
+            return jsonify({"ok": False, "msg": f"contracts.py nao encontrado: {e}"}), 500
+
+        ok, msg = ContractVM.validate(code)
+        if not ok:
+            return jsonify({"ok": False, "msg": msg}), 400
+
+        r = deploy(CHAIN, owner, code, metadata)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/contract/call", methods=["POST"])
+@_rate_limit
+def contract_call():
+    try:
+        data = request.get_json(force=True) or {}
+        contract_id = (data.get("contract_id") or "").strip()
+        caller = (data.get("caller") or "").strip()
+        args = data.get("args") or {}
+
+        if not contract_id:
+            return jsonify({"ok": False, "msg": "contract_id obrigatorio"}), 400
+
+        try:
+            from contracts import call as _call
+        except ImportError as e:
+            return jsonify({"ok": False, "msg": f"contracts.py nao encontrado: {e}"}), 500
+
+        r = _call(CHAIN, contract_id, caller, args)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/contract/<contract_id>", methods=["GET"])
+def contract_info(contract_id):
+    try:
+        c = CHAIN.db.contract_get(contract_id)
+        if not c:
+            return jsonify({"ok": False, "msg": "contrato nao existe"}), 404
+        return jsonify({
+            "ok": True,
+            "contract": c,
+            "state": CHAIN.db.contract_get_state(contract_id),
+            "events": CHAIN.db.contract_get_events(contract_id, limit=20),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+
+@app.route("/api/contracts", methods=["GET"])
+def contracts_list():
+    try:
+        owner = (request.args.get("owner") or "").strip() or None
+        return jsonify({
+            "ok": True,
+            "contracts": CHAIN.db.contract_list(owner=owner, limit=100),
+            "total": CHAIN.db.contract_count(),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 # ============================================================
@@ -385,5 +751,14 @@ def get_nonce(pubkey):
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v8 - http://0.0.0.0:{port}")
+    print(f"BRN Server v8.5 - http://0.0.0.0:{port}")
+
+    # Auto-start do minerador (usa miner_loop.iniciar_mineracao).
+    # Controlado por BRN_MINER_AUTO=1 (default).
+    try:
+        from miner_loop import iniciar_mineracao
+        iniciar_mineracao(CHAIN)
+    except Exception as e:
+        print(f"[server] aviso: auto-miner nao iniciado: {e}")
+
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

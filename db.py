@@ -1,6 +1,7 @@
-"""db.py — Banco SQLite do BRN (v5)
+"""db.py — Banco SQLite do BRN (v6)
 v4: + delete_blocks_above, + get_blocks_range, + peer score
 v5: + get_next_nonce, + get_nonce_for_pubkey (protecao replay)
+v6: + contratos inteligentes (tabelas contracts, contract_state, contract_events)
 """
 import time
 import zlib
@@ -32,10 +33,12 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
             CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
+
             CREATE TABLE IF NOT EXISTS transactions (
                 txid TEXT PRIMARY KEY, block_height INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_height);
+
             CREATE TABLE IF NOT EXISTS utxos (
                 txid TEXT NOT NULL, vout INTEGER NOT NULL,
                 address TEXT NOT NULL, amount INTEGER NOT NULL,
@@ -46,13 +49,16 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_utxo_addr ON utxos(address, spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_spent ON utxos(spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_h ON utxos(block_height);
+
             CREATE TABLE IF NOT EXISTS mempool (
                 txid TEXT PRIMARY KEY, raw BLOB NOT NULL,
                 fee INTEGER NOT NULL, received_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mp_fee ON mempool(fee DESC);
             CREATE INDEX IF NOT EXISTS idx_mp_time ON mempool(received_at);
+
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
             CREATE TABLE IF NOT EXISTS peers (
                 address TEXT PRIMARY KEY NOT NULL, node_id TEXT NOT NULL,
                 genesis_hash TEXT NOT NULL, version TEXT,
@@ -64,12 +70,42 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);
             CREATE INDEX IF NOT EXISTS idx_peers_genesis ON peers(genesis_hash);
             CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id);
+
             CREATE TABLE IF NOT EXISTS network_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL, event_type TEXT NOT NULL,
                 peer_address TEXT, details TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON network_events(timestamp DESC);
+
+            -- ============================================================
+            -- v6: CONTRATOS INTELIGENTES
+            -- ============================================================
+            CREATE TABLE IF NOT EXISTS contracts (
+                contract_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                code TEXT NOT NULL,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contracts_owner ON contracts(owner);
+            CREATE INDEX IF NOT EXISTS idx_contracts_created ON contracts(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS contract_state (
+                contract_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS contract_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                data TEXT,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contract_events_id
+                ON contract_events(contract_id, timestamp DESC);
             """)
             try:
                 cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
@@ -204,11 +240,8 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== NONCE / REPLAY PROTECTION (v5) ====================
+    # ==================== NONCE / REPLAY PROTECTION ====================
     def get_next_nonce(self, address: str) -> int:
-        """Retorna o proximo nonce para um endereco.
-        Nonce = quantidade de UTXOs gastos por este endereco.
-        """
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1",
             (address,)
@@ -216,7 +249,6 @@ class ChainDB:
         return int(row["c"])
 
     def get_nonce_for_pubkey(self, pubkey: str) -> int:
-        """Mesma coisa, mas busca por pubkey."""
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM utxos WHERE pubkey=? AND spent=1",
             (pubkey,)
@@ -269,7 +301,8 @@ class ChainDB:
     def get_stats(self):
         return {"height": self.height(), "tip_hash": self.tip_hash(),
                 "utxos": self.count_utxos(), "mempool": self.mempool_count(),
-                "blocks": self.height() + 1}
+                "blocks": self.height() + 1,
+                "contracts": self.contract_count()}
 
     # ==================== PODA ====================
     def prune_spent_utxos(self, keep_height=1000):
@@ -371,6 +404,170 @@ class ChainDB:
         rows = self.conn.execute("SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
         return [dict(r) for r in rows]
 
+    # ==================== CONTRATOS INTELIGENTES (v6) ====================
+    def contract_insert(self, contract_id, owner, code, metadata=None):
+        """Insere um contrato novo (ou substitui se existir)."""
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (contract_id, owner,
+                 orjson.dumps(code).decode(),
+                 orjson.dumps(metadata or {}).decode(),
+                 int(time.time()))
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) "
+                "VALUES (?,?,?)",
+                (contract_id, "{}", int(time.time()))
+            )
+
+    def contract_get(self, contract_id):
+        """Retorna o contrato completo ou None."""
+        row = self.conn.execute(
+            "SELECT * FROM contracts WHERE contract_id=?", (contract_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["code"] = orjson.loads(d["code"])
+        d["metadata"] = orjson.loads(d["metadata"] or "{}")
+        return d
+
+    def contract_list(self, owner=None, limit=100):
+        """Lista contratos, opcionalmente filtrando por owner."""
+        if owner:
+            rows = self.conn.execute(
+                "SELECT * FROM contracts WHERE owner=? ORDER BY created_at DESC LIMIT ?",
+                (owner, limit)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM contracts ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["code"] = orjson.loads(d["code"])
+            d["metadata"] = orjson.loads(d["metadata"] or "{}")
+            out.append(d)
+        return out
+
+    def contract_count(self):
+        """Conta quantos contratos existem na rede."""
+        return self.conn.execute("SELECT COUNT(*) AS c FROM contracts").fetchone()["c"]
+
+    def contract_delete(self, contract_id):
+        """Remove contrato + estado + eventos (uso administrativo)."""
+        with self.lock:
+            self.conn.execute("DELETE FROM contracts WHERE contract_id=?", (contract_id,))
+            self.conn.execute("DELETE FROM contract_state WHERE contract_id=?", (contract_id,))
+            self.conn.execute("DELETE FROM contract_events WHERE contract_id=?", (contract_id,))
+
+    def contract_get_state(self, contract_id):
+        """Retorna o estado atual (dict) do contrato."""
+        row = self.conn.execute(
+            "SELECT state FROM contract_state WHERE contract_id=?", (contract_id,)
+        ).fetchone()
+        return orjson.loads(row["state"]) if row else {}
+
+    def contract_set_state(self, contract_id, state):
+        """Grava o estado (dict) do contrato."""
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) "
+                "VALUES (?,?,?)",
+                (contract_id, orjson.dumps(state).decode(), int(time.time()))
+            )
+
+    def contract_log_event(self, contract_id, event, data):
+        """Grava um evento emitido pelo contrato."""
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO contract_events(contract_id, event, data, timestamp) "
+                "VALUES (?,?,?,?)",
+                (contract_id, event,
+                 orjson.dumps(data).decode() if data is not None else "null",
+                 int(time.time()))
+            )
+
+    def contract_get_events(self, contract_id, limit=50):
+        """Retorna os ultimos N eventos do contrato."""
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events WHERE contract_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (contract_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contract_all_events(self, limit=200):
+        """Retorna os ultimos eventos de TODOS os contratos."""
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    # ==================== CONTRATOS ====================
+    def contract_spend(self, from_addr: str, to_addr: str, amount: int):
+        """
+        Move fundos de from_addr para to_addr. Chamado por contracts.py.
+        Aqui é a única função que realmente aplica a transferência.
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
+            try:
+                # 1) Saca UTXOs de from_addr até cobrir o amount
+                rows = self.conn.execute(
+                    "SELECT txid, vout, amount FROM utxos "
+                    "WHERE address=? AND spent=0 ORDER BY amount DESC",
+                    (from_addr,)
+                ).fetchall()
+
+                total = 0
+                sacados = []
+                for r in rows:
+                    total += r["amount"]
+                    sacados.append((r["txid"], r["vout"], r["amount"]))
+                    if total >= amount:
+                        break
+
+                if total < amount:
+                    raise ValueError(
+                        f"saldo insuficiente: {total} < {amount}"
+                    )
+
+                # 2) Marca UTXOs como spent
+                for txid, vout, _amt in sacados:
+                    self.conn.execute(
+                        "UPDATE utxos SET spent=1, spent_by=? "
+                        "WHERE txid=? AND vout=?",
+                        (f"contract:{from_addr}", txid, vout)
+                    )
+
+                # 3) Credita em to_addr (cria UTXO novo)
+                agora = int(time.time() * 1000)
+                credito_txid = f"contract_spend_{agora}_credit"
+                self.conn.execute(
+                    "INSERT INTO utxos(txid, vout, address, amount, pubkey, "
+                    "block_height, spent) VALUES (?,?,?,?,?,?,0)",
+                    (credito_txid, 0, to_addr, amount, "", self.height())
+                )
+
+                # 4) Se sobrou troco, devolve pro contrato
+                troco = total - amount
+                if troco > 0:
+                    troco_txid = f"contract_spend_{agora}_change"
+                    self.conn.execute(
+                        "INSERT INTO utxos(txid, vout, address, amount, pubkey, "
+                        "block_height, spent) VALUES (?,?,?,?,?,?,0)",
+                        (troco_txid, 0, from_addr, troco, "", self.height())
+                    )
+
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
     # ==================== CLOSE ====================
     def close(self):
         self.conn.close()
