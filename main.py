@@ -1,6 +1,13 @@
 """
-main.py — Entrypoint unificado do no BRN (v6.1)
+main.py — Entrypoint unificado do no BRN (v6.2)
 ============================================================
+v6.2:
+  - [SEGURANÇA] Le BRN_NETWORK_SECRET e passa para Blockchain
+    como network_secret. Blocos passam a carregar auth_tag=HMAC(secret).
+    Sem o segredo, nenhum bloco e aceito (mesmo com PoW valido).
+  - Auto-gera segredo persistente se BRN_NETWORK_SECRET nao existir,
+    gravando em network_secret.txt (0600) e avisando o usuario.
+
 v6.1:
   - --client-mode: cliente NAO origina genesis, espera da rede.
   - Blockchain recebe auto_genesis=not args.client_mode.
@@ -14,16 +21,6 @@ v6.0 (breaking):
   - Removida senha hardcoded da carteira (BRN_WEB_PASS obrigatoria via env).
   - P2PManager recebe node_id_priv (handshake autenticado E2P).
   - --rotate-node-id para gerar nova identidade (backup automatico).
-
-Features herdadas:
-  --status        Diagnostico completo e sai
-  --headless      Sem interface grafica
-  --read-only     Nao minera, nao publica no GitHub
-  --version       Mostra versao
-  --check-update  Consulta GitHub por versao nova
-  --log-level     DEBUG | INFO | WARNING | ERROR
-  --log-file      Grava logs em JSON neste arquivo
-  --config        Arquivo de configuracao (padrao: config.json)
 ============================================================
 """
 import os
@@ -31,6 +28,7 @@ import sys
 import signal
 import argparse
 import hashlib
+import secrets
 import threading
 import time
 import json
@@ -51,9 +49,8 @@ _shutdown = threading.Event()
 # ============================================================
 BASE_DIR     = Path(__file__).parent.resolve()
 NODE_ID_PATH = BASE_DIR / "node_identity.enc"
+SECRET_PATH  = BASE_DIR / "network_secret.txt"
 
-# Timeout (segundos) que o cliente espera o genesis chegar antes de
-# continuar em modo "somente leitura" (nao minera, so sincroniza).
 CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 
 
@@ -79,36 +76,92 @@ def parse_args():
     p.add_argument("--log-file", default=None,
                    help="Log JSON neste arquivo")
 
-    # v6 — identidade do no
     p.add_argument("--password", default=None,
                    help="Senha do no (identidade Ed25519). Prefira "
                         "--password-file ou BRN_NODE_PASSWORD.")
     p.add_argument("--password-file", default=None,
                    help="Le a senha do no deste arquivo (mais seguro).")
     p.add_argument("--rotate-node-id", action="store_true",
-                   help="Gera nova identidade (backup automatico). "
-                        "Peers antigos nao vao reconhecer este no.")
+                   help="Gera nova identidade (backup automatico).")
 
-    # v6.1 — modo cliente e diagnostico
     p.add_argument("--client-mode", action="store_true",
-                   help="Nao origina genesis — espera receber da rede. "
-                        "Use nos PCs que NAO sao a origem da cadeia.")
+                   help="Nao origina genesis — espera receber da rede.")
     p.add_argument("--discover", action="store_true",
                    help="Diagnostico de descoberta de peers (15s) e sai")
+
+    p.add_argument("--rotate-secret", action="store_true",
+                   help="Gera um novo BRN_NETWORK_SECRET e grava em "
+                        "network_secret.txt. TODOS os nos precisam do "
+                        "novo segredo (rede para de aceitar blocos antigos).")
     return p.parse_args()
+
+
+# ============================================================
+# SEGREDO DA REDE (auth_tag dos blocos)
+# ============================================================
+def resolve_network_secret(args) -> str:
+    log = get_logger("secret")
+
+    if getattr(args, "rotate_secret", False):
+        new = secrets.token_hex(32)
+        try:
+            fd = os.open(str(SECRET_PATH),
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new)
+                f.flush()
+                os.fsync(f.fileno())
+            log.warning(
+                f"Novo segredo gerado e gravado em {SECRET_PATH}. "
+                f"Copie para as outras maquinas antes de reiniciar."
+            )
+        except Exception as e:
+            log.error(f"Falha ao gravar segredo: {e}")
+        return new
+
+    env = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+    if env:
+        if not SECRET_PATH.exists():
+            try:
+                fd = os.open(str(SECRET_PATH),
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(env)
+            except Exception:
+                pass
+        return env
+
+    if SECRET_PATH.exists():
+        try:
+            sec = SECRET_PATH.read_text(encoding="utf-8").strip()
+            if sec:
+                return sec
+        except Exception as e:
+            log.warning(f"Falha ao ler {SECRET_PATH}: {e}")
+
+    new = secrets.token_hex(32)
+    try:
+        fd = os.open(str(SECRET_PATH),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new)
+            f.flush()
+            os.fsync(f.fileno())
+        log.warning(
+            f"BRN_NETWORK_SECRET nao definido. Segredo novo gerado e "
+            f"gravado em {SECRET_PATH}.\n"
+            f"  Copie este arquivo (ou o conteudo) para TODAS as outras "
+            f"maquinas da rede, senao elas nao vao aceitar seus blocos."
+        )
+    except Exception as e:
+        log.error(f"Falha ao gravar segredo: {e}")
+    return new
 
 
 # ============================================================
 # RESOLUCAO DE SENHA DO NO
 # ============================================================
 def _resolve_password(args) -> str:
-    """
-    Ordem:
-      1. --password-file
-      2. --password
-      3. BRN_NODE_PASSWORD
-      4. prompt interativo (somente se TTY)
-    """
     if args.password_file:
         p = Path(args.password_file)
         if not p.exists():
@@ -136,9 +189,6 @@ def _resolve_password(args) -> str:
 # IDENTIDADE Ed25519
 # ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
-    """
-    Carrega/cria a identidade Ed25519. Retorna (priv, pub_hex).
-    """
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
 
@@ -250,6 +300,28 @@ def do_status(cfg):
     for p in bs[:5]:
         print(f"     - {p}")
     print()
+
+    print("  Auth de blocos (BRN_NETWORK_SECRET):")
+    sec_src = "?"
+    sec_val = ""
+    env_sec = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+    if env_sec:
+        sec_val = env_sec
+        sec_src = "env"
+    elif SECRET_PATH.exists():
+        try:
+            sec_val = SECRET_PATH.read_text(encoding="utf-8").strip()
+            sec_src = f"arquivo {SECRET_PATH.name}"
+        except Exception:
+            pass
+    if sec_val:
+        print(f"     Status : ATIVO ({sec_src})")
+        print(f"     Fingerprint: {hashlib.sha256(sec_val.encode()).hexdigest()[:16]}...")
+    else:
+        print("     Status : INATIVO (nenhum segredo configurado)")
+        print("     Rode com --rotate-secret para gerar um.")
+    print()
+
     db_path = cfg["db_path"]
     print(f"  DB path     : {db_path}")
     if not os.path.exists(db_path):
@@ -319,11 +391,14 @@ def _do_discover_diagnostic(cfg):
     tracker = os.environ.get("BRN_TRACKER", "")
     print(f"  Tracker       : {tracker or '(nao configurado)'}")
 
-    secret = os.environ.get("BRN_NETWORK_SECRET", "brunocoin-lan-2026")
-    token = hashlib.sha256(secret.encode()).hexdigest()[:8]
+    secret = os.environ.get("BRN_NETWORK_SECRET", "")
+    if not secret and SECRET_PATH.exists():
+        try:
+            secret = SECRET_PATH.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    token = hashlib.sha256(secret.encode()).hexdigest()[:8] if secret else "(vazio)"
     print(f"  Network token : {token}")
-    if secret == "brunocoin-lan-2026":
-        print("    [AVISO] usando secret DEFAULT — configure BRN_NETWORK_SECRET!")
 
     p2p_port = cfg["p2p_port"]
     print(f"\n  Porta P2P TCP {p2p_port}: ", end="")
@@ -494,7 +569,6 @@ def main():
             print("\nVoce esta na ultima versao.")
         return
 
-    # Auto-check silencioso
     try:
         upd = check_for_update(timeout=3)
         if upd.get("ok") and upd.get("update_available"):
@@ -503,7 +577,15 @@ def main():
         pass
 
     # ============================================================
-    # Identidade Ed25519 — ANTES do P2P
+    # v6.2 — Segredo da rede (auth_tag dos blocos)
+    # ============================================================
+    network_secret = resolve_network_secret(args)
+    fingerprint = hashlib.sha256(network_secret.encode()).hexdigest()[:16]
+    log.info(f"Auth de blocos: ATIVO (fingerprint {fingerprint}...)")
+    os.environ["BRN_NETWORK_SECRET"] = network_secret
+
+    # ============================================================
+    # Identidade Ed25519
     # ============================================================
     node_password = _resolve_password(args)
     try:
@@ -519,7 +601,7 @@ def main():
     log.info(f"No ID (pubkey): {node_id_pub}")
 
     # ============================================================
-    # Blockchain — auto_genesis depende do modo
+    # Blockchain
     # ============================================================
     from blockchain import Blockchain
     from p2p_unified import P2PManager
@@ -530,6 +612,7 @@ def main():
     chain = Blockchain(
         db_path,
         auto_genesis=not args.client_mode,
+        network_secret=network_secret,
     )
 
     if args.client_mode:
@@ -552,7 +635,7 @@ def main():
     log.info(f"Altura atual: {chain.db.height()}")
 
     # ============================================================
-    # P2P (handshake autenticado com identidade do no)
+    # P2P
     # ============================================================
     p2p = P2PManager(
         chain,
@@ -570,7 +653,7 @@ def main():
     threading.Thread(target=run_explorer, daemon=True, name="Explorer").start()
 
     # ============================================================
-    # Miner (so se temos bloco 0)
+    # Miner
     # ============================================================
     if chain.db.height() >= 0:
         try:
@@ -590,7 +673,7 @@ def main():
     log.info("No pronto. Ctrl+C para encerrar.")
 
     # ============================================================
-    # Cliente sem genesis: espera sincronizacao com timeout
+    # Cliente sem genesis
     # ============================================================
     if args.client_mode and chain.db.height() < 0:
         log.info(
@@ -622,7 +705,7 @@ def main():
                 log.warning(f"Nao foi possivel reiniciar miner: {e}")
 
     # ============================================================
-    # Loop principal (GUI ou headless)
+    # Loop principal
     # ============================================================
     use_wallet = not cfg["headless"]
     if use_wallet:
