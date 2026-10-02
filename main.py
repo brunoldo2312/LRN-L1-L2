@@ -1,6 +1,13 @@
 """
-main.py — Entrypoint unificado do no BRN (v6.0)
+main.py — Entrypoint unificado do no BRN (v6.1)
 ============================================================
+v6.1:
+  - --client-mode: cliente NAO origina genesis, espera da rede.
+  - Blockchain recebe auto_genesis=not args.client_mode.
+  - Espera de sincronizacao no boot do cliente (timeout configuravel).
+  - --discover: diagnostico de descoberta de peers.
+  - Aviso se BRN_NETWORK_SECRET estiver no default.
+
 v6.0 (breaking):
   - Identidade Ed25519 do no carregada/criada ANTES do P2P.
   - Senha do no: --password-file > --password > BRN_NODE_PASSWORD > prompt.
@@ -23,9 +30,11 @@ import os
 import sys
 import signal
 import argparse
+import hashlib
 import threading
 import time
 import json
+import socket
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -37,61 +46,73 @@ from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
 
 _shutdown = threading.Event()
 
+# ============================================================
+# CAMINHOS
+# ============================================================
+BASE_DIR     = Path(__file__).parent.resolve()
+NODE_ID_PATH = BASE_DIR / "node_identity.enc"
 
-# ============================================================
-# CAMINHO DA IDENTIDADE DO NO (v6)
-# ============================================================
-NODE_ID_PATH = Path("node_identity.enc")
+# Timeout (segundos) que o cliente espera o genesis chegar antes de
+# continuar em modo "somente leitura" (nao minera, so sincroniza).
+CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 
 
 # ============================================================
 # ARGUMENTOS
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node")
-    p.add_argument("--status", action="store_true", help="Diagnostico completo e sai")
-    p.add_argument("--headless", action="store_true", help="Sem interface grafica")
-    p.add_argument("--read-only", action="store_true", help="Nao minera nem publica")
-    p.add_argument("--version", action="store_true", help="Mostra versao e sai")
-    p.add_argument("--check-update", action="store_true", help="Verifica versao nova")
-    p.add_argument("--config", default="config.json", help="Arquivo de configuracao")
-    p.add_argument("--log-level", default=None, help="DEBUG|INFO|WARNING|ERROR")
-    p.add_argument("--log-file", default=None, help="Log JSON neste arquivo")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v6")
+    p.add_argument("--status", action="store_true",
+                   help="Diagnostico completo e sai")
+    p.add_argument("--headless", action="store_true",
+                   help="Sem interface grafica")
+    p.add_argument("--read-only", action="store_true",
+                   help="Nao minera nem publica")
+    p.add_argument("--version", action="store_true",
+                   help="Mostra versao e sai")
+    p.add_argument("--check-update", action="store_true",
+                   help="Verifica versao nova")
+    p.add_argument("--config", default="config.json",
+                   help="Arquivo de configuracao")
+    p.add_argument("--log-level", default=None,
+                   help="DEBUG|INFO|WARNING|ERROR")
+    p.add_argument("--log-file", default=None,
+                   help="Log JSON neste arquivo")
 
-    # v6 — chave do no
-    p.add_argument(
-        "--password", default=None,
-        help="Senha do no (identidade Ed25519). Se omitida, usa "
-             "BRN_NODE_PASSWORD do ambiente ou prompt interativo."
-    )
-    p.add_argument(
-        "--password-file", default=None,
-        help="Le a senha deste arquivo (mais seguro que --password)."
-    )
-    p.add_argument(
-        "--rotate-node-id", action="store_true",
-        help="Apaga a identidade atual (com backup) e gera uma nova. "
-             "CUIDADO: peers antigos nao vao reconhecer este no."
-    )
+    # v6 — identidade do no
+    p.add_argument("--password", default=None,
+                   help="Senha do no (identidade Ed25519). Prefira "
+                        "--password-file ou BRN_NODE_PASSWORD.")
+    p.add_argument("--password-file", default=None,
+                   help="Le a senha do no deste arquivo (mais seguro).")
+    p.add_argument("--rotate-node-id", action="store_true",
+                   help="Gera nova identidade (backup automatico). "
+                        "Peers antigos nao vao reconhecer este no.")
+
+    # v6.1 — modo cliente e diagnostico
+    p.add_argument("--client-mode", action="store_true",
+                   help="Nao origina genesis — espera receber da rede. "
+                        "Use nos PCs que NAO sao a origem da cadeia.")
+    p.add_argument("--discover", action="store_true",
+                   help="Diagnostico de descoberta de peers (15s) e sai")
     return p.parse_args()
 
 
 # ============================================================
-# v6: RESOLUCAO DE SENHA DO NO
+# RESOLUCAO DE SENHA DO NO
 # ============================================================
 def _resolve_password(args) -> str:
     """
-    Ordem de prioridade:
-      1. --password-file (le conteudo, mantendo espacos internos)
+    Ordem:
+      1. --password-file
       2. --password
-      3. Variavel de ambiente BRN_NODE_PASSWORD
-      4. Prompt interativo (somente se stdin for TTY)
+      3. BRN_NODE_PASSWORD
+      4. prompt interativo (somente se TTY)
     """
     if args.password_file:
         p = Path(args.password_file)
         if not p.exists():
             raise SystemExit(f"--password-file nao encontrado: {p}")
-        # rstrip apenas do \n final — espaços internos sao validos
         return p.read_text(encoding="utf-8").rstrip("\r\n")
 
     if args.password:
@@ -112,14 +133,11 @@ def _resolve_password(args) -> str:
 
 
 # ============================================================
-# v6: IDENTIDADE Ed25519 DO NO (E2P)
+# IDENTIDADE Ed25519
 # ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
     """
-    Carrega a identidade Ed25519 do no. Se nao existir (ou rotate=True),
-    gera uma nova e salva cifrada com a senha.
-
-    Retorna (Ed25519PrivateKey, pubkey_hex).
+    Carrega/cria a identidade Ed25519. Retorna (priv, pub_hex).
     """
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
@@ -138,27 +156,25 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
             raise SystemExit(
                 f"Falha ao decifrar {NODE_ID_PATH}: {e}\n"
                 f"Senha errada? Arquivo corrompido?\n"
-                f"Use --rotate-node-id para gerar uma nova identidade "
-                f"(voce perdera o reconhecimento nos peers)."
+                f"Use --rotate-node-id para gerar nova identidade."
             )
         sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
         pub_hex = data["pub"]
-        log.info(f"Identidade carregada: {pub_hex[:16]}…")
+        log.info(f"Identidade carregada: {pub_hex[:16]}...")
         return sk, pub_hex
 
-    # Primeira vez: gera e salva
     sk = Ed25519PrivateKey.generate()
     pub_hex = sk.public_key().public_bytes_raw().hex()
     save_wallet(str(NODE_ID_PATH), {
         "sk": sk.private_bytes_raw().hex(),
         "pub": pub_hex,
     }, password)
-    log.info(f"Identidade nova criada: {pub_hex[:16]}… ({NODE_ID_PATH})")
+    log.info(f"Identidade nova criada: {pub_hex[:16]}... ({NODE_ID_PATH})")
     return sk, pub_hex
 
 
 # ============================================================
-# VERSION CHECK (feature 13)
+# VERSION CHECK
 # ============================================================
 def _parse_version(s):
     try:
@@ -187,7 +203,7 @@ def check_for_update(timeout=5):
 
 
 # ============================================================
-# DIAGNOSTICO (feature 15)
+# DIAGNOSTICO
 # ============================================================
 def _try_local_api(port, path="/api/status", timeout=2):
     try:
@@ -210,6 +226,7 @@ def do_status(cfg):
     print(f"  Config      : {cfg.source}")
     print(f"  Python      : {sys.version.split()[0]}")
     print(f"  CWD         : {os.getcwd()}")
+    print(f"  Base dir    : {BASE_DIR}")
     print()
     print(f"  Web port    : {cfg['web_port']}")
     print(f"  Explorer    : {cfg['explorer_port']}")
@@ -243,18 +260,21 @@ def do_status(cfg):
             import sqlite3
             conn = sqlite3.connect(db_path)
             h = conn.execute("SELECT MAX(height) FROM blocks").fetchone()[0]
+            gen = conn.execute("SELECT hash FROM blocks WHERE height=0").fetchone()
             conn.close()
             print(f"  DB height   : {h if h is not None else '(vazio)'}")
+            if gen and gen[0]:
+                print(f"  DB genesis  : {gen[0][:24]}...")
         except Exception as e:
             print(f"  DB height   : erro ({e})")
     print()
 
-    # v6: status da identidade do no
     print(f"  Node ID     : ", end="")
     if NODE_ID_PATH.exists():
-        print(f"{NODE_ID_PATH} ({os.path.getsize(NODE_ID_PATH)} bytes)")
+        print(f"{NODE_ID_PATH.name} ({os.path.getsize(NODE_ID_PATH)} bytes)")
     else:
         print("(nao criada ainda — sera criada no proximo boot)")
+    print()
 
     live = _try_local_api(cfg["web_port"])
     if live:
@@ -273,6 +293,77 @@ def do_status(cfg):
         print(f"     Alvo     : {ms.get('address', '(nenhum)')}")
         print(f"     Blocos   : {ms.get('blocks_mined', 0)}")
     print()
+    print("=" * 64)
+
+
+def _do_discover_diagnostic(cfg):
+    print("=" * 64)
+    print("  BRN Discover Diagnostic")
+    print("=" * 64)
+
+    try:
+        from discovery_v2 import get_all_local_ips, get_primary_ip, _load_manual_peers
+    except ImportError as e:
+        print(f"  discovery_v2 nao disponivel: {e}")
+        return
+
+    ips = get_all_local_ips()
+    print(f"\n  IPs locais detectados:")
+    for ip in ips:
+        print(f"    - {ip}")
+    if not ips:
+        print("    (nenhum! problema de rede ou firewall local)")
+
+    print(f"\n  Peers manuais: {_load_manual_peers() or '(nenhum)'}")
+
+    tracker = os.environ.get("BRN_TRACKER", "")
+    print(f"  Tracker       : {tracker or '(nao configurado)'}")
+
+    secret = os.environ.get("BRN_NETWORK_SECRET", "brunocoin-lan-2026")
+    token = hashlib.sha256(secret.encode()).hexdigest()[:8]
+    print(f"  Network token : {token}")
+    if secret == "brunocoin-lan-2026":
+        print("    [AVISO] usando secret DEFAULT — configure BRN_NETWORK_SECRET!")
+
+    p2p_port = cfg["p2p_port"]
+    print(f"\n  Porta P2P TCP {p2p_port}: ", end="")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(("127.0.0.1", p2p_port))
+        print("ABERTA localmente")
+    except Exception as e:
+        print(f"fechada ({e})")
+    finally:
+        s.close()
+
+    print(f"\n  Escutando multicast + broadcast por 15s...")
+    print(f"  (Abra o no em outro PC da rede AGORA para testar)")
+
+    found = []
+    def on_peer(ip, port):
+        found.append(f"{ip}:{port}")
+        print(f"    [achou] {ip}:{port}")
+
+    stop_flag = [False]
+    try:
+        from discovery_v2 import UDPDiscovery
+        udp = UDPDiscovery(p2p_port, "diag", on_peer, lambda: not stop_flag[0])
+        udp.start()
+        time.sleep(15)
+        stop_flag[0] = True
+        udp.stop()
+    except Exception as e:
+        print(f"  falha ao iniciar UDPDiscovery: {e}")
+
+    print(f"\n  Resultado: {len(found)} peer(s) descoberto(s).")
+    if not found:
+        print("\n  Nenhum peer descoberto. Verifique:")
+        print("    1. Mesmo BRN_NETWORK_SECRET em ambos os PCs")
+        print("    2. Firewall permitindo UDP 50007 e TCP " + str(p2p_port))
+        print("    3. Mesmo Wi-Fi/LAN (sem client isolation)")
+        print("    4. Modo de rede = Privada no Windows")
+        print("    5. BRN_TRACKER apontando para o servidor do tracker")
     print("=" * 64)
 
 
@@ -315,13 +406,11 @@ def run_status_loop(chain, p2p):
 
 def run_wallet_main_thread():
     try:
-        # v6: BRN_WEB_PASS DEVE vir do ambiente. Nunca default hardcoded.
         if not os.environ.get("BRN_WEB_PASS"):
             get_logger("wallet").error(
                 "BRN_WEB_PASS nao definida. Defina a senha da carteira "
                 "como variavel de ambiente antes de iniciar o no:\n"
                 "  export BRN_WEB_PASS='sua-senha-forte'   (Linux/macOS)\n"
-                "  set BRN_WEB_PASS=sua-senha-forte        (Windows CMD)\n"
                 "  $env:BRN_WEB_PASS='sua-senha-forte'     (PowerShell)"
             )
             return
@@ -330,7 +419,7 @@ def run_wallet_main_thread():
         import webview
 
         log = get_logger("wallet")
-        index_path = Path(__file__).parent / "index_wallet.html"
+        index_path = BASE_DIR / "index_wallet.html"
         if not index_path.exists():
             log.error(f"index_wallet.html nao encontrado: {index_path}")
             return
@@ -375,6 +464,7 @@ def main():
     log.info("=" * 60)
     log.info(f"  BRN Node v{VERSION} ({BUILD_DATE})")
     log.info(f"  Config: {cfg.source}")
+    log.info(f"  Modo  : {'CLIENTE (nao origina genesis)' if args.client_mode else 'ORIGEM'}")
     log.info("=" * 60)
 
     if args.version:
@@ -383,6 +473,10 @@ def main():
 
     if args.status:
         do_status(cfg)
+        return
+
+    if args.discover:
+        _do_discover_diagnostic(cfg)
         return
 
     if args.check_update:
@@ -409,7 +503,7 @@ def main():
         pass
 
     # ============================================================
-    # v6: IDENTIDADE Ed25519 DO NO — ANTES do P2P
+    # Identidade Ed25519 — ANTES do P2P
     # ============================================================
     node_password = _resolve_password(args)
     try:
@@ -417,7 +511,6 @@ def main():
             node_password, rotate=args.rotate_node_id
         )
     finally:
-        # limpa a senha do escopo o quanto antes
         try:
             del node_password
         except Exception:
@@ -425,18 +518,42 @@ def main():
 
     log.info(f"No ID (pubkey): {node_id_pub}")
 
-    # Import tardio (apos config)
+    # ============================================================
+    # Blockchain — auto_genesis depende do modo
+    # ============================================================
     from blockchain import Blockchain
     from p2p_unified import P2PManager
 
     db_path = cfg["db_path"]
     log.info(f"Abrindo DB: {db_path}")
-    chain = Blockchain(db_path)
+
+    chain = Blockchain(
+        db_path,
+        auto_genesis=not args.client_mode,
+    )
+
+    if args.client_mode:
+        if chain.db.height() < 0:
+            log.info("Cliente: DB vazio. Aguardando genesis da rede...")
+        else:
+            gen_row = None
+            try:
+                gen_row = chain.db.conn.execute(
+                    "SELECT hash FROM blocks WHERE height=0"
+                ).fetchone()
+            except Exception:
+                pass
+            gen_hash = gen_row[0][:16] if gen_row and gen_row[0] else "?"
+            log.info(
+                f"Cliente: DB ja tem altura {chain.db.height()} "
+                f"(genesis {gen_hash}...)"
+            )
+
     log.info(f"Altura atual: {chain.db.height()}")
 
-    # v6: P2PManager recebe node_id_priv (2o argumento posicional).
-    # Ele usa para assinar o handshake X25519 (autentica este no) e para
-    # derivar a chave de sessao por peer.
+    # ============================================================
+    # P2P (handshake autenticado com identidade do no)
+    # ============================================================
     p2p = P2PManager(
         chain,
         node_id_priv,
@@ -444,25 +561,69 @@ def main():
         enable_upnp=cfg["upnp"],
     )
     p2p.start()
-    log.info(f"P2P porta {cfg['p2p_port']} | No ID: {node_id_pub[:16]}…")
+    log.info(f"P2P porta {cfg['p2p_port']} | No ID: {node_id_pub[:16]}...")
 
+    # ============================================================
+    # HTTP + Explorer
+    # ============================================================
     threading.Thread(target=run_http,     daemon=True, name="HTTP").start()
     threading.Thread(target=run_explorer, daemon=True, name="Explorer").start()
 
-    try:
-        from miner_loop import get_miner
-        get_miner(chain)
-        log.info("Miner: aguardando botao 'Iniciar Mineracao' na carteira")
-    except ImportError:
-        log.warning("miner_loop.py nao encontrado")
-    except Exception as e:
-        log.error(f"Miner erro: {e}")
+    # ============================================================
+    # Miner (so se temos bloco 0)
+    # ============================================================
+    if chain.db.height() >= 0:
+        try:
+            from miner_loop import get_miner
+            get_miner(chain)
+            log.info("Miner: aguardando botao 'Iniciar Mineracao' na carteira")
+        except ImportError:
+            log.warning("miner_loop.py nao encontrado")
+        except Exception as e:
+            log.error(f"Miner erro: {e}")
+    else:
+        log.info("Cliente: DB sem genesis — miner bloqueado ate sincronizar")
 
     threading.Thread(target=run_status_loop, args=(chain, p2p),
                      daemon=True, name="StatusLoop").start()
 
     log.info("No pronto. Ctrl+C para encerrar.")
 
+    # ============================================================
+    # Cliente sem genesis: espera sincronizacao com timeout
+    # ============================================================
+    if args.client_mode and chain.db.height() < 0:
+        log.info(
+            f"Aguardando genesis de um peer (timeout {CLIENT_BOOT_TIMEOUT}s)..."
+        )
+        t0 = time.time()
+        while chain.db.height() < 0 and (time.time() - t0) < CLIENT_BOOT_TIMEOUT:
+            if _shutdown.is_set():
+                break
+            time.sleep(1)
+
+        if chain.db.height() < 0:
+            log.warning(
+                "TIMEOUT esperando genesis. O no continua rodando em modo "
+                "sincronizacao (nao minera) ate um peer enviar o bloco 0.\n"
+                "Verifique:\n"
+                "  - BRN_TRACKER aponta para o servidor do tracker\n"
+                "  - O no de origem (A) esta online e anunciando\n"
+                "  - BRN_NETWORK_SECRET identico entre A e B\n"
+                "  - Firewall libera TCP 6001 e UDP 50007"
+            )
+        else:
+            log.info(f"Genesis recebido! Altura: {chain.db.height()}")
+            try:
+                from miner_loop import get_miner
+                get_miner(chain)
+                log.info("Miner reinicializado apos sync do genesis")
+            except Exception as e:
+                log.warning(f"Nao foi possivel reiniciar miner: {e}")
+
+    # ============================================================
+    # Loop principal (GUI ou headless)
+    # ============================================================
     use_wallet = not cfg["headless"]
     if use_wallet:
         try:

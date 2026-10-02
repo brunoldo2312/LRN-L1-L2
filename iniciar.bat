@@ -1,391 +1,208 @@
 @echo off
 chcp 65001 >nul
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-echo ============================================================
-echo   Corrigindo main.py e server.py (v8 sem bridge)
-echo ============================================================
-echo.
+REM ============================================================
+REM   BRN Node - HUB CENTRAL (OTIMIZADO)
+REM ============================================================
 
-if exist main.py (
-    if not exist main.py.bak copy main.py main.py.bak >nul
-)
-if exist server.py (
-    if not exist server.py.bak copy server.py server.py.bak >nul
-)
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference = 'Stop';" ^
-  "$server = @'" ^
-"'''server.py — Backend HTTP do no BRN (v8 - sem bridge)'''" ^
-"from flask import Flask, request, jsonify" ^
-"from flask_cors import CORS" ^
-"import os, time, json, threading" ^
-"from functools import wraps" ^
-"from wallet import Wallet, WalletManager, HDWalletManager" ^
-"from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash" ^
-"" ^
-"app = Flask(__name__)" ^
-"CORS(app)" ^
-"CHAIN = Blockchain('brn_v2_chain.db')" ^
-"WALLETS_FILE = 'user_wallets.json'" ^
-"FAUCET_AMOUNT_BRN = 10" ^
-"FAUCET_MAX_PER_ADDRESS = 3" ^
-"FAUCET_COOLDOWN_S = 60 * 60" ^
-"_faucet_history = {}" ^
-"RATE_LIMIT = 30" ^
-"RATE_WINDOW_S = 60" ^
-"_ip_history = {}" ^
-"_rate_lock = threading.Lock()" ^
-"_cache_saldos = {}" ^
-"_cache_lock = threading.Lock()" ^
-"CACHE_TTL_S = 5" ^
-"" ^
-"def _rate_limit(f):" ^
-"    @wraps(f)" ^
-"    def wrapper(*args, **kwargs):" ^
-"        ip = request.remote_addr or '?'" ^
-"        agora = time.time()" ^
-"        with _rate_lock:" ^
-"            hist = _ip_history.setdefault(ip, [])" ^
-"            hist[:] = [t for t in hist if agora - t < RATE_WINDOW_S]" ^
-"            if len(hist) >= RATE_LIMIT:" ^
-"                return jsonify({'success': False, 'error': 'Muitas requisicoes.'}), 429" ^
-"            hist.append(agora)" ^
-"        return f(*args, **kwargs)" ^
-"    return wrapper" ^
-"" ^
-"def _saldo_cache_get(addr):" ^
-"    with _cache_lock:" ^
-"        if addr in _cache_saldos:" ^
-"            ts, val = _cache_saldos[addr]" ^
-"            if time.time() - ts < CACHE_TTL_S:" ^
-"                return val" ^
-"    return None" ^
-"" ^
-"def _saldo_cache_set(addr, val):" ^
-"    with _cache_lock:" ^
-"        _cache_saldos[addr] = (time.time(), val)" ^
-"" ^
-"def _saldo_cache_invalidate(addr):" ^
-"    with _cache_lock:" ^
-"        _cache_saldos.pop(addr, None)" ^
-"" ^
-"def carregar_wallets():" ^
-"    if not os.path.exists(WALLETS_FILE):" ^
-"        return {}" ^
-"    try:" ^
-"        with open(WALLETS_FILE) as f:" ^
-"            return json.load(f)" ^
-"    except Exception:" ^
-"        return {}" ^
-"" ^
-"def salvar_wallets(w):" ^
-"    with open(WALLETS_FILE, 'w') as f:" ^
-"        json.dump(w, f, indent=2)" ^
-"" ^
-"@app.route('/api/nova-carteira', methods=['POST'])" ^
-"@_rate_limit" ^
-"def nova_carteira():" ^
-"    try:" ^
-"        w = Wallet()" ^
-"        dados = {'success': True, 'address': w.address, 'private_key': w.priv_hex, 'public_key': w.pub_hex, 'warning': 'Guarde a chave privada.'}" ^
-"        wallets = carregar_wallets()" ^
-"        wallets[w.address] = {'public_key': w.pub_hex}" ^
-"        salvar_wallets(wallets)" ^
-"        return jsonify(dados)" ^
-"    except Exception as e:" ^
-"        return jsonify({'success': False, 'error': str(e)}), 500" ^
-"" ^
-"@app.route('/api/saldo/<address>', methods=['GET'])" ^
-"def saldo(address):" ^
-"    try:" ^
-"        cached = _saldo_cache_get(address)" ^
-"        if cached is None:" ^
-"            utxos = CHAIN.db.get_utxos(address)" ^
-"            cached = sum(u['amount'] for u in utxos)" ^
-"            _saldo_cache_set(address, cached)" ^
-"        return jsonify({'success': True, 'address': address, 'balance_sats': cached, 'balance_brn': cached / 10**8})" ^
-"    except Exception as e:" ^
-"        return jsonify({'success': False, 'error': str(e)}), 500" ^
-"" ^
-"@app.route('/api/portfolio/<address>', methods=['GET'])" ^
-"def portfolio(address):" ^
-"    try:" ^
-"        cached = _saldo_cache_get(address)" ^
-"        if cached is None:" ^
-"            utxos = CHAIN.db.get_utxos(address)" ^
-"            cached = sum(u['amount'] for u in utxos)" ^
-"            _saldo_cache_set(address, cached)" ^
-"        return jsonify({'portfolio': {'BRN': cached / 10**8, 'KYC': 0}})" ^
-"    except Exception as e:" ^
-"        return jsonify({'portfolio': {}, 'error': str(e)}), 500" ^
-"" ^
-"@app.route('/api/transacoes/<address>', methods=['GET'])" ^
-"def transacoes(address):" ^
-"    try:" ^
-"        txs = []" ^
-"        for h in range(CHAIN.db.height() + 1):" ^
-"            block = CHAIN.db.get_block(h)" ^
-"            if not block:" ^
-"                continue" ^
-"            for tx in block['transactions']:" ^
-"                if any(o.get('address') == address for o in tx['outputs']):" ^
-"                    txs.append({'txid': tx['txid'], 'block_height': h, 'timestamp': tx.get('timestamp', 0), 'outputs': tx['outputs']})" ^
-"        return jsonify({'success': True, 'address': address, 'count': len(txs), 'transactions': txs[-50:]})" ^
-"    except Exception as e:" ^
-"        return jsonify({'success': False, 'error': str(e)}), 500" ^
-"" ^
-"@app.route('/api/transfer', methods=['POST'])" ^
-"@_rate_limit" ^
-"def transfer():" ^
-"    try:" ^
-"        data = request.get_json(force=True) or {}" ^
-"        sender = data.get('from', '').strip()" ^
-"        to = data.get('to', '').strip()" ^
-"        amount = data.get('amount')" ^
-"        sk = data.get('private_key', '')" ^
-"        pk = data.get('public_key', '')" ^
-"        if not WalletManager.validate_address(sender):" ^
-"            return jsonify({'ok': False, 'msg': 'Remetente invalido.'}), 400" ^
-"        if not WalletManager.validate_address(to):" ^
-"            return jsonify({'ok': False, 'msg': 'Destinatario invalido.'}), 400" ^
-"        if sender == to:" ^
-"            return jsonify({'ok': False, 'msg': 'Nao pode enviar para si.'}), 400" ^
-"        try:" ^
-"            amount_sats = int(float(amount) * 10**8)" ^
-"        except (ValueError, TypeError):" ^
-"            return jsonify({'ok': False, 'msg': 'Valor invalido.'}), 400" ^
-"        if amount_sats <= 0:" ^
-"            return jsonify({'ok': False, 'msg': 'Valor deve ser > 0.'}), 400" ^
-"        try:" ^
-"            w = Wallet(private_key_hex=sk)" ^
-"        except Exception:" ^
-"            return jsonify({'ok': False, 'msg': 'Chave privada invalida.'}), 400" ^
-"        if w.address != sender:" ^
-"            return jsonify({'ok': False, 'msg': 'Chave privada nao corresponde.'}), 400" ^
-"        utxos = CHAIN.db.get_utxos(sender)" ^
-"        utxos.sort(key=lambda u: u['amount'], reverse=True)" ^
-"        total, escolhidos = 0, []" ^
-"        for u in utxos:" ^
-"            escolhidos.append(u)" ^
-"            total += u['amount']" ^
-"            if total >= amount_sats + 1000:" ^
-"                break" ^
-"        if total < amount_sats:" ^
-"            return jsonify({'ok': False, 'msg': 'Saldo insuficiente.'}), 400" ^
-"        FEE = 1000" ^
-"        troco = total - amount_sats - FEE" ^
-"        outputs = [{'address': to, 'amount': amount_sats, 'pubkey': ''}]" ^
-"        if troco > 0:" ^
-"            outputs.append({'address': sender, 'amount': troco, 'pubkey': ''})" ^
-"        inputs = [{'txid': u['txid'], 'vout': u['vout'], 'pubkey': w.pub_hex, 'signature': ''} for u in escolhidos]" ^
-"        nonce = CHAIN.db.get_nonce_for_pubkey(w.pub_hex)" ^
-"        tx = {'txid': '', 'inputs': inputs, 'outputs': outputs, 'timestamp': int(time.time()), 'locktime': 0, 'nonce': nonce}" ^
-"        h = signing_hash(tx)" ^
-"        for inp in tx['inputs']:" ^
-"            inp['signature'] = w.sign(h)" ^
-"        tx['txid'] = calc_txid(tx)" ^
-"        ok, msg = CHAIN.submit_tx(tx)" ^
-"        if not ok:" ^
-"            return jsonify({'ok': False, 'msg': msg}), 400" ^
-"        _saldo_cache_invalidate(sender)" ^
-"        _saldo_cache_invalidate(to)" ^
-"        return jsonify({'ok': True, 'txid': tx['txid'], 'nonce': nonce, 'msg': 'Aceita na mempool.'})" ^
-"    except Exception as e:" ^
-"        return jsonify({'ok': False, 'msg': str(e)}), 500" ^
-"" ^
-"@app.route('/api/mine', methods=['POST'])" ^
-"@_rate_limit" ^
-"def mine():" ^
-"    try:" ^
-"        data = request.get_json(force=True) or {}" ^
-"        miner = data.get('validator_address', '').strip()" ^
-"        if not WalletManager.validate_address(miner):" ^
-"            return jsonify({'ok': False, 'msg': 'Endereco invalido.'}), 400" ^
-"        block = CHAIN.mine_block(miner)" ^
-"        if not block:" ^
-"            return jsonify({'ok': False, 'msg': 'Falha.'}), 500" ^
-"        _saldo_cache_invalidate(miner)" ^
-"        return jsonify({'ok': True, 'msg': 'Bloco minerado!', 'block': {'height': block['height'], 'hash': block['hash'], 'txs': len(block['transactions']), 'difficulty': block['difficulty'], 'nonce': block['nonce']}})" ^
-"    except Exception as e:" ^
-"        return jsonify({'ok': False, 'msg': str(e)}), 500" ^
-"" ^
-"@app.route('/api/faucet', methods=['POST'])" ^
-"@_rate_limit" ^
-"def faucet():" ^
-"    try:" ^
-"        data = request.get_json(force=True) or {}" ^
-"        addr = data.get('address', '').strip()" ^
-"        if not WalletManager.validate_address(addr):" ^
-"            return jsonify({'ok': False, 'msg': 'Endereco invalido.'}), 400" ^
-"        agora = time.time()" ^
-"        hist = _faucet_history.setdefault(addr, [])" ^
-"        hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]" ^
-"        if len(hist) >= FAUCET_MAX_PER_ADDRESS:" ^
-"            return jsonify({'ok': False, 'msg': 'Limite.'}), 429" ^
-"        block = CHAIN.mine_block(addr)" ^
-"        if not block:" ^
-"            return jsonify({'ok': False, 'msg': 'Falha.'}), 500" ^
-"        hist.append(agora)" ^
-"        _saldo_cache_invalidate(addr)" ^
-"        return jsonify({'ok': True, 'msg': 'Faucet enviado.', 'amount': FAUCET_AMOUNT_BRN})" ^
-"    except Exception as e:" ^
-"        return jsonify({'ok': False, 'msg': str(e)}), 500" ^
-"" ^
-"@app.route('/api/chain-info', methods=['GET'])" ^
-"def chain_info():" ^
-"    return jsonify({'success': True, 'name': 'BrunoCoin', 'ticker': 'BRN', 'height': CHAIN.db.height(), 'tip_hash': CHAIN.db.tip_hash(), 'reward': CHAIN.current_reward(CHAIN.db.height() + 1), 'difficulty': CHAIN.current_difficulty()})" ^
-"" ^
-"@app.route('/api/status', methods=['GET'])" ^
-"def status():" ^
-"    return jsonify({'name': 'BrunoCoin', 'ticker': 'BRN', 'height': CHAIN.db.height(), 'tip_hash': CHAIN.db.tip_hash(), 'utxos': CHAIN.db.count_utxos(), 'mempool': len(CHAIN.db.all_mempool(limit=10000)), 'peers': CHAIN.db.contar_peers(apenas_ativos=True), 'reward': CHAIN.current_reward(CHAIN.db.height() + 1), 'difficulty': CHAIN.current_difficulty()})" ^
-"" ^
-"@app.route('/api/fee-estimate', methods=['GET'])" ^
-"def fee_estimate():" ^
-"    return jsonify({'success': True, 'low': CHAIN.estimate_fee('low'), 'medium': CHAIN.estimate_fee('medium'), 'high': CHAIN.estimate_fee('high'), 'min_relay_fee': 1000})" ^
-"" ^
-"@app.route('/api/work', methods=['GET'])" ^
-"def work():" ^
-"    return jsonify({'success': True, 'height': CHAIN.db.height(), 'cumulative_work': CHAIN.cumulative_work()})" ^
-"" ^
-"@app.route('/api/nonce/<pubkey>', methods=['GET'])" ^
-"def get_nonce(pubkey):" ^
-"    return jsonify({'success': True, 'pubkey': pubkey, 'next_nonce': CHAIN.db.get_nonce_for_pubkey(pubkey)})" ^
-"" ^
-"if __name__ == '__main__':" ^
-"    port = int(os.environ.get('BRN_WEB_PORT', '5000'))" ^
-"    print(f'BRN Server v8 - http://0.0.0.0:{port}')" ^
-"    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)" ^
-"'@;" ^
-"Set-Content -Path 'server.py' -Value $server -Encoding UTF8;" ^
-"Write-Host 'OK server.py';" ^
-"" ^
-"$main = @'" ^
-"'''main.py - Entrypoint unificado (v8)'''" ^
-"import os" ^
-"import signal" ^
-"import threading" ^
-"import time" ^
-"from pathlib import Path" ^
-"from blockchain import Blockchain" ^
-"from server import app as http_app" ^
-"from explorer import app as explorer_app" ^
-"from p2p_unified import P2PManager" ^
-"" ^
-"DB_PATH = os.environ.get('BRN_DB', 'brn_v2_chain.db')" ^
-"HTTP_PORT = int(os.environ.get('BRN_WEB_PORT', '5000'))" ^
-"EXPLORER_PORT = int(os.environ.get('BRN_EXPLORER_PORT', '8080'))" ^
-"P2P_PORT = int(os.environ.get('BRN_P2P_PORT', '6001'))" ^
-"ENABLE_UPNP = os.environ.get('BRN_UPNP', '1') == '1'" ^
-"ENABLE_WALLET = os.environ.get('BRN_WALLET', '0') == '1'" ^
-"ENABLE_MINER = os.environ.get('BRN_MINER_AUTO', '1') == '1'" ^
-"_shutdown = threading.Event()" ^
-"" ^
-"def run_http():" ^
-"    print(f'[HTTP]     http://0.0.0.0:{HTTP_PORT}')" ^
-"    http_app.run(host='0.0.0.0', port=HTTP_PORT, threaded=True, debug=False, use_reloader=False)" ^
-"" ^
-"def run_explorer():" ^
-"    print(f'[Explorer] http://0.0.0.0:{EXPLORER_PORT}')" ^
-"    explorer_app.run(host='0.0.0.0', port=EXPLORER_PORT, threaded=True, debug=False, use_reloader=False)" ^
-"" ^
-"def run_status_loop(chain, p2p):" ^
-"    while not _shutdown.is_set():" ^
-"        time.sleep(30)" ^
-"        try:" ^
-"            peers = p2p.get_status()" ^
-"            print(f'[Status] Altura={chain.db.height()} | Peers={peers[\"peer_count\"]} | UTXOs={chain.db.count_utxos()}')" ^
-"        except Exception:" ^
-"            pass" ^
-"" ^
-"def run_wallet_main_thread():" ^
-"    try:" ^
-"        os.environ.setdefault('BRN_WEB_PASS', 'carteira123')" ^
-"        from app_wallet_v3 import WalletApi" ^
-"        import webview" ^
-"        index_path = Path(__file__).parent / 'index_wallet.html'" ^
-"        if not index_path.exists():" ^
-"            print('[Wallet] index_wallet.html nao encontrado')" ^
-"            return" ^
-"        api = WalletApi()" ^
-"        print('[Wallet] Abrindo janela desktop (main thread)...')" ^
-"        webview.create_window('BRN RWA - Carteira Digital', url=index_path.resolve().as_uri(), js_api=api, width=1020, height=880, min_size=(820, 640), background_color='#0d1117')" ^
-"        webview.start(debug=False)" ^
-"    except Exception as e:" ^
-"        print(f'[Wallet] Falha: {e}')" ^
-"" ^
-"def main():" ^
-"    print('=' * 64)" ^
-"    print('  BRN Node v8 + Miner + Wallet')" ^
-"    print('=' * 64)" ^
-"    print(f'[Chain] Abrindo DB: {DB_PATH}')" ^
-"    chain = Blockchain(DB_PATH)" ^
-"    print(f'        Altura atual : {chain.db.height()}')" ^
-"    p2p = P2PManager(chain, tcp_port=P2P_PORT, enable_upnp=ENABLE_UPNP)" ^
-"    p2p.start()" ^
-"    print(f'[P2P]     TCP porta {P2P_PORT} (UPnP={\"ON\" if ENABLE_UPNP else \"OFF\"})')" ^
-"    threading.Thread(target=run_http, daemon=True, name='HTTP').start()" ^
-"    threading.Thread(target=run_explorer, daemon=True, name='Explorer').start()" ^
-"    if ENABLE_MINER:" ^
-"        try:" ^
-"            from miner_loop import iniciar_mineracao" ^
-"            iniciar_mineracao(chain)" ^
-"        except ImportError:" ^
-"            print('[Miner] miner_loop.py nao encontrado')" ^
-"    threading.Thread(target=run_status_loop, args=(chain, p2p), daemon=True, name='StatusLoop').start()" ^
-"    print()" ^
-"    print('No pronto. Ctrl+C para encerrar.')" ^
-"    print()" ^
-"    if ENABLE_WALLET:" ^
-"        try:" ^
-"            run_wallet_main_thread()" ^
-"        except KeyboardInterrupt:" ^
-"            pass" ^
-"    else:" ^
-"        try:" ^
-"            while not _shutdown.is_set():" ^
-"                time.sleep(1)" ^
-"        except KeyboardInterrupt:" ^
-"            pass" ^
-"    print('Encerrando...')" ^
-"    _shutdown.set()" ^
-"    p2p.stop()" ^
-"    chain.db.close()" ^
-"    print('Ate logo.')" ^
-"" ^
-"def _on_signal(signum, frame):" ^
-"    _shutdown.set()" ^
-"" ^
-"if __name__ == '__main__':" ^
-"    signal.signal(signal.SIGINT, _on_signal)" ^
-"    signal.signal(signal.SIGTERM, _on_signal)" ^
-"    main()" ^
-"'@;" ^
-"Set-Content -Path 'main.py' -Value $main -Encoding UTF8;" ^
-"Write-Host 'OK main.py'"
-
-echo.
 echo ============================================================
-echo   Arquivos reescritos. Verificando...
+echo   BRN Node - HUB CENTRAL
 echo ============================================================
 echo.
 
-findstr /C:"v8" main.py >nul
+REM ============================================================
+REM  >>>  SENHAS - AJUSTE AQUI <<<
+REM ============================================================
+set "BRN_NODE_PASSWORD=senha-da-carteira-2026"
+set "BRN_WEB_PASS=senha-da-carteira-2026"
+
+REM === Auto-reset (requer main.py hibrido) ===
+set "BRN_NODE_AUTORESET=1"
+
+REM ============================================================
+REM  REDE - IGUAL EM TODOS OS PCs
+REM ============================================================
+set "BRN_NETWORK_SECRET=brunocoin-lan-2026"
+set "BRN_TRACKER=https://brn-tracker.onrender.com"
+set "BRN_BOOTSTRAP_PEERS=177.82.132.98:6001"
+
+REM ============================================================
+REM  MINERACAO
+REM ============================================================
+set "BRN_MINER_AUTO=1"
+set "BRN_MINER_INTERVAL=30"
+set "BRN_ALLOW_SOLO_MINING=1"
+set "BRN_MIN_PEER_STABLE=10"
+
+REM ============================================================
+REM  REDE / UPNP / AUTH
+REM ============================================================
+set "BRN_UPNP=1"
+set "BRN_P2P_AUTH=optional"
+
+REM ============================================================
+REM  PORTAS
+REM ============================================================
+set "BRN_WEB_PORT=5000"
+set "BRN_EXPLORER_PORT=8080"
+set "BRN_P2P_PORT=6001"
+
+REM ============================================================
+REM  >>>  SYNC OTIMIZADO <<<
+REM ============================================================
+set "BRN_SYNC_BATCH=500"
+set "BRN_SYNC_PARALELO_MIN=500"
+set "BRN_SYNC_PARALELO_WORKERS=4"
+set "BRN_SYNC_RETRY_MAX=5"
+set "BRN_TCP_TIMEOUT=30.0"
+
+REM ============================================================
+REM  LOG
+REM ============================================================
+set "BRN_LOG_LEVEL=INFO"
+set "PYTHONUNBUFFERED=1"
+
+REM ============================================================
+REM  1) VERIFICA PYTHON
+REM ============================================================
+where python >nul 2>nul
 if errorlevel 1 (
-    echo [X] main.py NAO foi atualizado
-) else (
-    echo [OK] main.py v8
+    echo [X] Python nao encontrado no PATH.
+    echo     Instale em https://python.org ^(marque "Add to PATH"^)
+    pause
+    exit /b 1
 )
+for /f "tokens=2" %%i in ('python --version 2^>^&1') do set "PYVER=%%i"
+echo [ok] Python !PYVER!
+echo.
 
-findstr /C:"v8" server.py >nul
+REM ============================================================
+REM  2) INSTALA DEPENDENCIAS
+REM ============================================================
+if exist requirements.txt (
+    echo [*] Instalando dependencias...
+    python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+) else (
+    python -m pip install --quiet flask flask-cors requests orjson cryptography argon2-cffi mnemonic pywebview
+)
+echo [ok] Dependencias prontas
+echo.
+
+REM ============================================================
+REM  3) VERIFICA ARQUIVOS ESSENCIAIS
+REM ============================================================
+set "FALTA="
+for %%f in (main.py server.py blockchain.py wallet.py db.py p2p_unified.py) do (
+    if not exist "%%f" set "FALTA=!FALTA! %%f"
+)
+if not "!FALTA!"=="" (
+    echo [X] Arquivos faltando:!FALTA!
+    pause
+    exit /b 1
+)
+echo [ok] Arquivos essenciais presentes
+echo.
+
+REM ============================================================
+REM  4) IDENTIDADE
+REM ============================================================
+if exist node_identity.enc (
+    echo [i] node_identity.enc JA EXISTE
+    echo     Senha configurada: !BRN_NODE_PASSWORD!
+    echo     Auto-reset:        !BRN_NODE_AUTORESET!
+    echo.
+    echo     Se a senha estiver errada:
+    if "!BRN_NODE_AUTORESET!"=="1" (
+        echo       - Sera renomeada para .corrompida automaticamente
+        echo       - E uma identidade NOVA sera criada
+    ) else (
+        echo       - Vai travar. Renomeie manualmente:
+        echo         ren node_identity.enc node_identity.enc.antiga
+    )
+    echo.
+) else (
+    echo [i] node_identity.enc NAO existe - sera criada agora
+)
+echo.
+
+REM ============================================================
+REM  5) BOOTSTRAP PEERS
+REM ============================================================
+if not exist bootstrap_peers.json (
+    echo ["177.82.132.98:6001"] > bootstrap_peers.json
+    echo [ok] bootstrap_peers.json criado
+) else (
+    echo [ok] bootstrap_peers.json ja existe
+)
+echo.
+
+REM ============================================================
+REM  6) TESTA TRACKER
+REM ============================================================
+echo [*] Testando tracker !BRN_TRACKER!...
+python -c "import urllib.request; r=urllib.request.urlopen('!BRN_TRACKER!/', timeout=15); print('[ok]', r.read().decode().strip())" 2>nul
 if errorlevel 1 (
-    echo [X] server.py NAO foi atualizado
-) else (
-    echo [OK] server.py v8
+    echo [!] Tracker nao respondeu ^(pode estar dormindo - free tier^)
 )
+echo.
 
+REM ============================================================
+REM  7) pywebview
+REM ============================================================
+set "HEADLESS_FLAG="
+python -c "import webview" 2>nul
+if errorlevel 1 (
+    set "HEADLESS_FLAG=--headless"
+    echo [!] pywebview ausente - modo HEADLESS
+) else (
+    echo [ok] pywebview OK - carteira desktop vai abrir
+)
 echo.
-echo Agora rode: iniciar.bat
+
+REM ============================================================
+REM  8) RESUMO
+REM ============================================================
+echo ============================================================
+echo   CONFIGURACAO ATUAL
+echo ============================================================
+echo   Modo       : HUB
+echo   Secret rede: !BRN_NETWORK_SECRET!
+echo   Node pass  : !BRN_NODE_PASSWORD!
+echo   Auto-reset : !BRN_NODE_AUTORESET!
+echo   Tracker    : !BRN_TRACKER!
+echo   Bootstrap  : !BRN_BOOTSTRAP_PEERS!
+echo   Mineracao  : !BRN_MINER_AUTO! ^(intervalo !BRN_MINER_INTERVAL!s^)
+echo   Solo mining: !BRN_ALLOW_SOLO_MINING!
+echo   Sync batch : !BRN_SYNC_BATCH!
+echo   Sync paral.: !BRN_SYNC_PARALELO_MIN! ^(workers !BRN_SYNC_PARALELO_WORKERS!^)
+echo   P2P porta  : !BRN_P2P_PORT!
+echo   HTTP       : http://127.0.0.1:!BRN_WEB_PORT!
+echo   Explorer   : http://127.0.0.1:!BRN_EXPLORER_PORT!
+echo ============================================================
 echo.
+echo   ATENCAO: deixe esta janela ABERTA enquanto o hub roda.
+echo.
+
+REM ============================================================
+REM  9) INICIA O NO
+REM ============================================================
+echo [*] Iniciando HUB BRN... ^(Ctrl+C para encerrar^)
+echo.
+python main.py !HEADLESS_FLAG!
+
+set "EXITCODE=!ERRORLEVEL!"
+echo.
+if !EXITCODE! neq 0 (
+    echo [X] O no saiu com codigo !EXITCODE!
+    echo.
+    echo Se o erro foi "Falha ao decifrar node_identity.enc":
+    echo   1. Rode: ren node_identity.enc node_identity.enc.antiga
+    echo   2. Rode este .bat de novo
+    echo.
+) else (
+    echo [ok] No encerrado normalmente.
+)
 pause
+endlocal
