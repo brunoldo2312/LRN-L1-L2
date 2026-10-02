@@ -1,7 +1,8 @@
-"""server.py — Backend HTTP do no BRN (v8.5)
-v8.5: _pubkey_from_db_or_payload agora consulta user_wallets.json,
-      aceita private_key no payload para derivar pubkey, e registra
-      no user_wallets.json quando descobre a pubkey.
+"""server.py — Backend HTTP do no BRN (v8.6)
+v8.6: + /api/minhas-txs/<addr> (lista txs com direcao/status/conf)
+      + fallback robusto em /api/transacoes (try/except por bloco)
+v8.5: _pubkey_from_db_or_payload consulta user_wallets.json, aceita
+      private_key no payload, e registra pubkey descoberta.
 v8.4: + /api/miner/start e /api/miner/stop (miner_loop singleton)
       + aliases /api/miner/on, /api/start-mining, /api/send, /api/enviar
 v8.3: + endpoints de contratos inteligentes (/api/contract/*)
@@ -104,32 +105,27 @@ def salvar_wallets(w):
 
 
 # ============================================================
-# v8.5: RESOLUCAO DA PUBKEY (3 fontes + derivacao)
+# v8.5: RESOLUCAO DA PUBKEY (4 fontes + derivacao)
 # ============================================================
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
                                payload_sk: str = "") -> str:
     """
     Retorna a pubkey do endereco. Ordem de prioridade:
-
-      1. payload_pubkey (o frontend manda explicitamente)
-      2. payload_sk   -> deriva a pubkey e confere o endereco
-      3. user_wallets.json (salvo por /api/nova-carteira)
-      4. tabela utxos (so existe se o endereco ja recebeu algo)
-
-    Se descobrir a pubkey por (2) e o endereco ainda nao estiver
-    em user_wallets.json, registra para chamadas futuras.
+      1. payload_pubkey (frontend manda)
+      2. payload_sk   -> deriva pubkey e confere endereco
+      3. user_wallets.json
+      4. tabela utxos via get_utxos() (thread-safe)
     """
-    # 1) Payload explicito
+    # 1) Payload
     if payload_pubkey:
         return payload_pubkey.strip()
 
-    # 2) Derivar a partir da private key, se veio
+    # 2) Derivar da private key
     if payload_sk:
         try:
             _w = Wallet(private_key_hex=payload_sk.strip())
             if _w.address == addr:
                 pk = _w.pub_hex
-                # Aproveita pra persistir no user_wallets.json
                 try:
                     wallets = carregar_wallets()
                     if wallets.get(addr, {}).get("public_key") != pk:
@@ -151,14 +147,12 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
     except Exception:
         pass
 
-    # 4) Tabela utxos
+    # 4) Tabela utxos (usa get_utxos, thread-safe)
     try:
-        row = CHAIN.db.conn.execute(
-            "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
-            (addr,)
-        ).fetchone()
-        if row and row[0]:
-            return row[0]
+        for u in CHAIN.db.get_utxos(addr):
+            pk = (u.get("pubkey") or "").strip()
+            if pk:
+                return pk
     except Exception:
         pass
 
@@ -180,9 +174,6 @@ def nova_carteira():
             "public_key": w.pub_hex,
             "warning": "Guarde a chave privada."
         }
-        # Persiste a pubkey vinculada ao endereco.
-        # Isso permite que /api/miner/start e /api/faucet achem a pubkey
-        # sem precisar esperar uma tx.
         wallets = carregar_wallets()
         wallets[w.address] = {"public_key": w.pub_hex}
         salvar_wallets(wallets)
@@ -228,10 +219,19 @@ def portfolio(address):
 # ============================================================
 @app.route("/api/transacoes/<address>", methods=["GET"])
 def transacoes(address):
+    """
+    Lista txs onde o endereco aparece como OUTPUT (recebidas).
+    Versao robusta: try/except por bloco, para nao derrubar a rota
+    se um bloco especifico tiver dado corrompido.
+    """
     try:
         txs = []
-        for h in range(CHAIN.db.height() + 1):
-            block = CHAIN.db.get_block(h)
+        altura = CHAIN.db.height()
+        for h in range(altura + 1):
+            try:
+                block = CHAIN.db.get_block(h)
+            except Exception:
+                continue
             if not block:
                 continue
             for tx in block["transactions"]:
@@ -246,6 +246,122 @@ def transacoes(address):
                         "count": len(txs), "transactions": txs[-50:]})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/minhas-txs/<address>", methods=["GET"])
+def minhas_txs(address):
+    """
+    v8.6: Lista todas as txs que envolvem o endereco.
+    Inclui direcao (sent/received/self), status (pending/confirmed),
+    valor e confirmacoes. Cobre tanto blocos quanto mempool.
+    """
+    try:
+        altura = CHAIN.db.height()
+
+        # Coleta pubkeys associadas ao endereco (utxos atuais)
+        try:
+            meus_utxos = CHAIN.db.get_utxos(address)
+        except Exception:
+            meus_utxos = []
+        minhas_pubkeys = {u.get("pubkey") for u in meus_utxos if u.get("pubkey")}
+
+        txs = []
+        for h in range(altura + 1):
+            try:
+                block = CHAIN.db.get_block(h)
+            except Exception:
+                continue
+            if not block:
+                continue
+
+            for tx in block["transactions"]:
+                is_mine_out = any(
+                    o.get("address") == address for o in tx["outputs"]
+                )
+                is_mine_in = False
+                if minhas_pubkeys:
+                    for inp in tx["inputs"]:
+                        pk = inp.get("pubkey")
+                        if pk and pk in minhas_pubkeys:
+                            is_mine_in = True
+                            break
+
+                # Coinbase sem vinculo: se nao for output nosso, ignora
+                if not (is_mine_out or is_mine_in):
+                    continue
+
+                meu_out = sum(
+                    o["amount"] for o in tx["outputs"]
+                    if o.get("address") == address
+                )
+
+                if is_mine_in and is_mine_out:
+                    direction = "self"
+                elif is_mine_in:
+                    direction = "sent"
+                else:
+                    direction = "received"
+
+                confs = max(0, altura - h)
+                txs.append({
+                    "txid": tx["txid"],
+                    "direction": direction,
+                    "amount": meu_out,
+                    "status": "confirmed",
+                    "block_height": h,
+                    "confirmations": confs,
+                    "timestamp": tx.get("timestamp", 0),
+                })
+
+        # Mempool: txs pendentes que envolvem o endereco
+        try:
+            mem = CHAIN.db.all_mempool(limit=500)
+            for tx in mem:
+                is_mine_out = any(
+                    o.get("address") == address for o in tx["outputs"]
+                )
+                is_mine_in = False
+                if minhas_pubkeys:
+                    for inp in tx["inputs"]:
+                        pk = inp.get("pubkey")
+                        if pk and pk in minhas_pubkeys:
+                            is_mine_in = True
+                            break
+                if not (is_mine_out or is_mine_in):
+                    continue
+
+                meu_out = sum(
+                    o["amount"] for o in tx["outputs"]
+                    if o.get("address") == address
+                )
+                if is_mine_in and is_mine_out:
+                    direction = "self"
+                elif is_mine_in:
+                    direction = "sent"
+                else:
+                    direction = "received"
+
+                txs.append({
+                    "txid": tx["txid"],
+                    "direction": direction,
+                    "amount": meu_out,
+                    "status": "pending",
+                    "block_height": None,
+                    "confirmations": 0,
+                    "timestamp": tx.get("timestamp", 0),
+                })
+        except Exception:
+            pass
+
+        txs.sort(key=lambda t: (t.get("timestamp") or 0), reverse=True)
+        return jsonify({
+            "ok": True,
+            "address": address,
+            "count": len(txs),
+            "transactions": txs[:100],
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/transfer", methods=["POST"])
@@ -422,7 +538,7 @@ def miner_stop():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# Aliases (variantes que algumas versoes da UI usam)
+# Aliases
 @app.route("/api/miner/on", methods=["POST"])
 @app.route("/api/start-mining", methods=["POST"])
 def miner_start_alias():
@@ -452,6 +568,7 @@ def miner_status():
             "count": st.get("count", st.get("blocks_mined", 0)),
             "last_height": st.get("last_height"),
             "uptime": st.get("uptime", 0),
+            "consecutive_failures": st.get("consecutive_failures", 0),
             "height": CHAIN.db.height(),
             "difficulty": CHAIN.current_difficulty(),
             "last_error": st.get("last_error", ""),
@@ -566,7 +683,6 @@ def hd_create():
         if strength not in (128, 160, 192, 224, 256):
             return jsonify({"ok": False, "msg": "strength invalido"}), 400
         result = HDWalletManager.create(strength=strength)
-        # Registra a pubkey do index 0 no user_wallets.json
         try:
             wallets = carregar_wallets()
             wallets[result["address"]] = {"public_key": result["public_key"]}
@@ -751,10 +867,8 @@ def contracts_list():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v8.5 - http://0.0.0.0:{port}")
+    print(f"BRN Server v8.6 - http://0.0.0.0:{port}")
 
-    # Auto-start do minerador (usa miner_loop.iniciar_mineracao).
-    # Controlado por BRN_MINER_AUTO=1 (default).
     try:
         from miner_loop import iniciar_mineracao
         iniciar_mineracao(CHAIN)
