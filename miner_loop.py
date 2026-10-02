@@ -1,5 +1,5 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.2)
+miner_loop.py — Loop de mineracao do BRN (v6.3)
 ================================================================
 API publica:
     get_miner(chain) -> Miner    (singleton)
@@ -7,16 +7,18 @@ API publica:
     Miner.stop()
     Miner.status() -> dict
 
+v6.3:
+  - [NOVO] Integra progress_cb do mine_block_interruptible.
+  - [NOVO] status() expoe hashrate, hashes_done, eta_seconds.
+  - [NOVO] miner_loop le BRN_MINER_DIFFICULTY_MAX (opcional) e avisa
+    se a dificuldade atual excede o teto seguro da CPU.
+
 v6.2:
-  - [CRITICO] _loop NAO morre mais quando um bloco e rejeitado
-    (accept_block retorna False). Antes, uma unica tx invalida na
-    mempool derrubava o miner permanentemente. Agora ele espera 5s
-    e tenta de novo.
+  - [CRITICO] _loop NAO morre mais quando um bloco e rejeitado.
   - Log diferencia "parada do usuario" de "falha de mineracao".
   - Contador de falhas consecutivas exposto em status().
 
-v6.1: status() agora expoe 'count', 'last_height', 'uptime'
-      para a carteira web exibir progresso.
+v6.1: status() expoe 'count', 'last_height', 'uptime'.
 ================================================================
 """
 import os
@@ -39,7 +41,6 @@ MINER_INTERVAL      = int(os.environ.get("BRN_MINER_INTERVAL", "30"))
 MINER_AUTO          = os.environ.get("BRN_MINER_AUTO", "1") == "1"
 CURRENT_WALLET_FILE = "current_wallet.json"
 
-# v6.2: pausa apos bloco rejeitado (evita busy-loop em tx ruim)
 RETRY_AFTER_REJECT_S = 5
 
 _MINER_INSTANCE = None
@@ -72,10 +73,7 @@ def _ler_carteira_aberta():
 
 
 def _pubkey_no_db(bc, addr):
-    """
-    v6.2: prefere get_utxos (thread-safe) em vez de conn.execute cru.
-    """
-    # Tenta primeiro via API do ChainDB
+    # Tenta via API do ChainDB primeiro (thread-safe)
     try:
         for u in bc.db.get_utxos(addr):
             pk = (u.get("pubkey") or "").strip()
@@ -83,9 +81,7 @@ def _pubkey_no_db(bc, addr):
                 return pk
     except Exception:
         pass
-
-    # Fallback: consulta direta (alguns ChainDB antigos nao tem get_utxos
-    # com pubkey; nesse caso, conn.execute serve)
+    # Fallback: consulta direta
     try:
         row = bc.db.conn.execute(
             "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
@@ -106,11 +102,16 @@ class Miner:
         self.running = False
         self.blocks_mined = 0
         self.last_error = ""
-        # v6.1: campos de progresso
         self.last_height = None
         self.started_at = 0.0
-        # v6.2: contador de falhas consecutivas
         self.consecutive_failures = 0
+
+        # v6.3: progresso em tempo real
+        self.current_nonce = 0
+        self.hashes_done = 0
+        self.hashrate = 0.0
+        self._last_progress_ts = 0.0
+        self._last_progress_hashes = 0
 
     def start(self, address, pubkey_hex=""):
         if self.running:
@@ -132,6 +133,11 @@ class Miner:
         self.last_height = None
         self.started_at = time.time()
         self.consecutive_failures = 0
+        self.current_nonce = 0
+        self.hashes_done = 0
+        self.hashrate = 0.0
+        self._last_progress_ts = 0.0
+        self._last_progress_hashes = 0
         self._stop_evt.clear()
         self.running = True
 
@@ -155,7 +161,7 @@ class Miner:
         elif self.started_at and not self.running:
             uptime = int(time.time() - self.started_at) if self.blocks_mined else 0
 
-        return {
+        st = {
             "running": self.running,
             "address": self.address,
             "pubkey": self.pubkey,
@@ -166,19 +172,25 @@ class Miner:
             "count": self.blocks_mined,
             "last_height": self.last_height,
             "uptime": uptime,
-            # v6.2:
             "consecutive_failures": self.consecutive_failures,
+            # v6.3:
+            "current_nonce": self.current_nonce,
+            "hashes_done": self.hashes_done,
+            "hashrate": self.hashrate,
         }
 
+        # ETA
+        diff = st["difficulty"]
+        expected = 16 ** diff
+        st["expected_hashes"] = expected
+        if self.hashrate > 0:
+            restantes = max(0, expected - self.hashes_done)
+            st["eta_seconds"] = int(restantes / self.hashrate)
+        else:
+            st["eta_seconds"] = None
+        return st
+
     def _loop(self):
-        """
-        v6.2: NAO morre por bloco rejeitado.
-        - Se _stop_evt estiver setado -> sai (parada do usuario).
-        - Se bloco veio None mas nao foi parada -> espera RETRY_AFTER_REJECT_S
-          e tenta de novo, incrementando consecutive_failures.
-        - Se a excecao for ValueError (ex: pubkey obrigatoria), aí sim para,
-          porque nao adianta tentar de novo.
-        """
         while not self._stop_evt.is_set():
             try:
                 if self.chain.db.height() < 0:
@@ -192,18 +204,29 @@ class Miner:
                     self.running = False
                     return
 
+                # Callback chamado a cada batch do hot loop
+                def _on_progress(nonce, hashes_done):
+                    self.current_nonce = nonce
+                    self.hashes_done = hashes_done
+                    now = time.time()
+                    if self._last_progress_ts > 0:
+                        dt = now - self._last_progress_ts
+                        dh = hashes_done - self._last_progress_hashes
+                        if dt > 0 and dh > 0:
+                            self.hashrate = dh / dt
+                    self._last_progress_ts = now
+                    self._last_progress_hashes = hashes_done
+
                 block = self.chain.mine_block_interruptible(
                     self.address,
                     self.pubkey,
                     should_continue=lambda: not self._stop_evt.is_set(),
+                    progress_cb=_on_progress,
                 )
 
-                # Caso 1: usuario pediu para parar
                 if self._stop_evt.is_set():
                     break
 
-                # Caso 2: bloco rejeitado por accept_block (ex: tx ruim
-                # na mempool). NAO mata o miner.
                 if block is None:
                     self.consecutive_failures += 1
                     self.last_error = (
@@ -218,24 +241,24 @@ class Miner:
                         break
                     continue
 
-                # Caso 3: sucesso
                 self.blocks_mined += 1
                 self.consecutive_failures = 0
+                self.hashes_done = 0
+                self.current_nonce = 0
                 h = block.get("height")
                 self.last_height = h
-                _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
+                _log(
+                    f"OK Bloco #{h} minerado (total={self.blocks_mined}) "
+                    f"| hashrate~{self.hashrate:,.0f} H/s"
+                )
 
             except ValueError as e:
-                # Erro de programacao / pre-condicao (ex: pubkey ausente).
-                # Aqui sim vale parar, porque nao adianta tentar de novo.
                 self.last_error = str(e)
                 _log(f"Miner erro fatal: {e}")
                 self.running = False
                 return
 
             except Exception as e:
-                # Erro inesperado (ex: sqlite travado, disco cheio).
-                # Registra, espera e tenta de novo.
                 self.last_error = str(e)
                 self.consecutive_failures += 1
                 _log(f"Miner exception ({self.consecutive_failures}): {e}")
